@@ -8,9 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{cmp, fmt, mem, ops, slice};
 
-use syscall::error::Error;
-use syscall::error::{EADDRINUSE, EEXIST, ENOMEM};
-
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -216,96 +213,6 @@ where
     H: Send + Sync + Handle,
     G: Sync,
 {
-}
-
-#[derive(Debug, Error)]
-#[error("failed to add guard, due to another guard already existing")]
-pub struct AddGuardError;
-
-impl From<AddGuardError> for Error {
-    fn from(_: AddGuardError) -> Error {
-        Error::new(EEXIST)
-    }
-}
-
-pub struct WithGuardError<T> {
-    pub this: T,
-}
-impl<T> fmt::Debug for WithGuardError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WithGuardError")
-            // TODO
-            .finish()
-    }
-}
-
-impl<T> fmt::Display for WithGuardError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "failed to replace guard, due to another guard already existing"
-        )
-    }
-}
-impl<T> std::error::Error for WithGuardError<T> {}
-impl<T> From<WithGuardError<T>> for AddGuardError {
-    fn from(_: WithGuardError<T>) -> Self {
-        Self
-    }
-}
-impl<T> From<WithGuardError<T>> for Error {
-    fn from(_: WithGuardError<T>) -> Error {
-        Error::new(EEXIST)
-    }
-}
-pub struct ReclaimError<T> {
-    pub this: T,
-}
-impl<T> fmt::Display for ReclaimError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to reclaim buffer slice, since it was in use")
-    }
-}
-impl<T> fmt::Debug for ReclaimError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReclaimError").finish()
-    }
-}
-impl<T> std::error::Error for ReclaimError<T> {}
-impl<T> From<ReclaimError<T>> for Error {
-    fn from(_: ReclaimError<T>) -> Error {
-        Error::new(EADDRINUSE)
-    }
-}
-
-pub struct CloseError<T> {
-    pub this: T,
-}
-impl<T> fmt::Display for CloseError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to close since buffers were in use")
-    }
-}
-impl<T> fmt::Debug for CloseError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloseError")
-            // TODO
-            .finish()
-    }
-}
-impl<T> From<CloseError<T>> for Error {
-    fn from(_: CloseError<T>) -> Error {
-        Error::new(EADDRINUSE)
-    }
-}
-#[derive(Debug, Error)]
-#[error("failed to expand buffer: arithmetic overflow")]
-pub struct BeginExpandError;
-
-impl From<BeginExpandError> for Error {
-    fn from(_: BeginExpandError) -> Error {
-        Error::new(ENOMEM)
-    }
 }
 
 impl<'a, H, G> BufferSlice<'a, H, G>
@@ -935,6 +842,104 @@ pub trait Guard {
     /// Try to release the guard, returning either true for success or false for failure.
     fn try_release(&self) -> bool;
 }
+
+#[derive(Debug, Error)]
+#[error("failed to add guard, due to another guard already existing")]
+pub struct AddGuardError;
+
+pub struct WithGuardError<T> {
+    pub this: T,
+}
+impl<T> fmt::Debug for WithGuardError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WithGuardError")
+            // TODO
+            .finish()
+    }
+}
+
+impl<T> fmt::Display for WithGuardError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to replace guard, due to another guard already existing"
+        )
+    }
+}
+impl<T> std::error::Error for WithGuardError<T> {}
+impl<T> From<WithGuardError<T>> for AddGuardError {
+    fn from(_: WithGuardError<T>) -> Self {
+        Self
+    }
+}
+pub struct ReclaimError<T> {
+    pub this: T,
+}
+impl<T> fmt::Display for ReclaimError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to reclaim buffer slice, since it was in use")
+    }
+}
+impl<T> fmt::Debug for ReclaimError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReclaimError").finish()
+    }
+}
+impl<T> std::error::Error for ReclaimError<T> {}
+
+pub struct CloseError<T> {
+    pub this: T,
+}
+impl<T> fmt::Display for CloseError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to close since buffers were in use")
+    }
+}
+impl<T> fmt::Debug for CloseError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloseError")
+            // TODO
+            .finish()
+    }
+}
+#[derive(Debug, Error)]
+#[error("failed to expand buffer: arithmetic overflow")]
+pub struct BeginExpandError;
+
+#[cfg(feature = "redox")]
+mod libc_error_impls {
+    use super::*;
+
+    use syscall::error::Error;
+    use syscall::error::{EADDRINUSE, EEXIST, ENOMEM};
+
+    impl From<BeginExpandError> for Error {
+        fn from(_: BeginExpandError) -> Error {
+            Error::new(ENOMEM)
+        }
+    }
+    impl<T> From<CloseError<T>> for Error {
+        fn from(_: CloseError<T>) -> Error {
+            Error::new(EADDRINUSE)
+        }
+    }
+    impl<T> From<ReclaimError<T>> for Error {
+        fn from(_: ReclaimError<T>) -> Error {
+            Error::new(EADDRINUSE)
+        }
+    }
+    impl<T> From<WithGuardError<T>> for Error {
+        fn from(_: WithGuardError<T>) -> Error {
+            Error::new(EEXIST)
+        }
+    }
+    impl From<AddGuardError> for Error {
+        fn from(_: AddGuardError) -> Error {
+            Error::new(EEXIST)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
