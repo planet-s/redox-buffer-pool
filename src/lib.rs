@@ -4,8 +4,8 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::TryInto;
 use std::ptr::NonNull;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::{cmp, fmt, mem, ops, slice};
 
 use syscall::error::{Error, Result};
@@ -209,12 +209,14 @@ unsafe impl<'a, H, G: Guard> Send for BufferSlice<'a, H, G>
 where
     H: Send + Sync + Handle,
     G: Send,
-{}
+{
+}
 unsafe impl<'a, H, G: Guard> Sync for BufferSlice<'a, H, G>
 where
     H: Send + Sync + Handle,
     G: Sync,
-{}
+{
+}
 
 #[derive(Debug, Error)]
 #[error("failed to add guard, due to another guard already existing")]
@@ -239,7 +241,10 @@ impl<T> fmt::Debug for WithGuardError<T> {
 
 impl<T> fmt::Display for WithGuardError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to replace guard, due to another guard already existing")
+        write!(
+            f,
+            "failed to replace guard, due to another guard already existing"
+        )
     }
 }
 impl<T> std::error::Error for WithGuardError<T> {}
@@ -263,8 +268,7 @@ impl<T> fmt::Display for ReclaimError<T> {
 }
 impl<T> fmt::Debug for ReclaimError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReclaimError")
-            .finish()
+        f.debug_struct("ReclaimError").finish()
     }
 }
 impl<T> std::error::Error for ReclaimError<T> {}
@@ -316,7 +320,9 @@ where
                 let pool = match self.pool {
                     Left(reference) => reference,
                     Right(ref weak) => {
-                        arc = weak.upgrade().expect("calling unguard on a weakly-owned buffer slice where the pool died");
+                        arc = weak.upgrade().expect(
+                            "calling unguard on a weakly-owned buffer slice where the pool died",
+                        );
                         &*arc
                     }
                 };
@@ -359,11 +365,12 @@ where
     /// Tries to add a guard of potentially a different type than the guard type in this slice.
     /// Because of that this, this will consume self and construct a different `BufferSlice` with
     /// a different guard type, or error with `self` if there was already a guard present.
-    pub fn with_guard<OtherGuard: Guard>(self, other: OtherGuard) -> Result<BufferSlice<'a, H, OtherGuard>, WithGuardError<Self>> {
+    pub fn with_guard<OtherGuard: Guard>(
+        self,
+        other: OtherGuard,
+    ) -> Result<BufferSlice<'a, H, OtherGuard>, WithGuardError<Self>> {
         if self.guard.is_some() {
-            return Err(WithGuardError {
-                this: self
-            });
+            return Err(WithGuardError { this: self });
         }
         let start = self.start;
         let pointer = self.pointer;
@@ -423,9 +430,7 @@ where
                 mem::forget(self);
                 Ok(())
             }
-            false => Err(ReclaimError {
-                this: self,
-            }),
+            false => Err(ReclaimError { this: self }),
         }
     }
 
@@ -451,9 +456,7 @@ where
         match self.reclaim_inner() {
             true => (),
             false => {
-                log::debug!(
-                    "Trying to drop a BufferSlice that is in use, leaking memory",
-                );
+                log::debug!("Trying to drop a BufferSlice that is in use, leaking memory",);
             }
         }
     }
@@ -631,9 +634,7 @@ impl<H: Handle> BufferPool<H> {
     /// as possible when this happens, rather than the entire pool).
     pub fn close(mut self) -> Result<Option<H>, CloseError<Self>> {
         if self.guarded_occ_count.load(Ordering::Acquire) > 0 {
-            return Err(CloseError {
-                this: self,
-            });
+            return Err(CloseError { this: self });
         }
 
         let handle = self.handle.take();
@@ -763,7 +764,11 @@ impl<H: Handle> BufferPool<H> {
 
         Some((offset..offset + len, pointer))
     }
-    pub fn acquire_borrowed_slice<G: Guard>(&self, len: u32, alignment: u32) -> Option<BufferSlice<'_, H, G>> {
+    pub fn acquire_borrowed_slice<G: Guard>(
+        &self,
+        len: u32,
+        alignment: u32,
+    ) -> Option<BufferSlice<'_, H, G>> {
         let (range, pointer) = self.acquire_slice(len, alignment)?;
 
         Some(BufferSlice {
