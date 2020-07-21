@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{cmp, fmt, mem, ops, slice};
 
-use syscall::error::{Error, Result};
-use syscall::error::{EADDRINUSE, EEXIST, ENOMEM, EOVERFLOW};
+use syscall::error::Error;
+use syscall::error::{EADDRINUSE, EEXIST, ENOMEM};
 
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
@@ -293,6 +293,20 @@ impl<T> fmt::Debug for CloseError<T> {
             .finish()
     }
 }
+impl<T> From<CloseError<T>> for Error {
+    fn from(_: CloseError<T>) -> Error {
+        Error::new(EADDRINUSE)
+    }
+}
+#[derive(Debug, Error)]
+#[error("failed to expand buffer: arithmetic overflow")]
+pub struct BeginExpandError;
+
+impl From<BeginExpandError> for Error {
+    fn from(_: BeginExpandError) -> Error {
+        Error::new(ENOMEM)
+    }
+}
 
 impl<'a, H, G> BufferSlice<'a, H, G>
 where
@@ -511,8 +525,9 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
     /// # Safety
     ///
     /// For this to be safe, the pointer must be a valid allocation (anywhere) of the size
-    /// originally inputted. TODO: alignment
-    pub unsafe fn initialize(self, pointer: *mut u8) -> Result<()> {
+    /// originally inputted. THE POINTER MUST NOT BE NULL, or the rust compiler will execute the
+    /// wrong code! TODO: alignment
+    pub unsafe fn initialize(self, pointer: *mut u8) {
         let mut write_guard = self.pool.mmap_map.write();
         let mmap_map = &mut *write_guard;
 
@@ -520,7 +535,7 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
         let old_offset_half = MmapOffsetHalf::pending(self.offset());
 
         let new_info_half = MmapInfoHalf {
-            addr: NonNull::new(pointer as *const u8 as *mut u8).ok_or(Error::new(ENOMEM))?,
+            addr: NonNull::new_unchecked(pointer as *const u8 as *mut u8),
             size: self.len(),
         };
 
@@ -559,12 +574,10 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
                 &RangeOffsetComparator,
             )
             .expect_none("expected newly-acquired slice not to conflict with any existing");
-
-        Ok(())
     }
 }
 impl<H: Handle> BufferPool<H> {
-    pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H>> {
+    pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H>, BeginExpandError> {
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
             // readers to continue acquiring new slices etc, but only allows this thread to be able
@@ -590,7 +603,7 @@ impl<H: Handle> BufferPool<H> {
                         last_key
                             .offset()
                             .checked_add(last_value.size)
-                            .ok_or(Error::new(EOVERFLOW))
+                            .ok_or(BeginExpandError)
                     },
                 )?;
 
@@ -598,7 +611,7 @@ impl<H: Handle> BufferPool<H> {
                 // TODO: Reclaim old ranges if possible, rather than failing. Perhaps one could use
                 // a circular ring buffer to allow for O(1) range acquisition, with O(log n)
                 // freeing, if we combine a ring buffer for contiguous ranges, with a B-tree.
-                return Err(Error::new(EOVERFLOW));
+                return Err(BeginExpandError);
             }
 
             let mut mmap_write_guard = RwLockUpgradableReadGuard::upgrade(mmap_intent_guard);
@@ -916,7 +929,7 @@ impl<H: Handle> Drop for BufferPool<H> {
 }
 
 pub trait Handle {
-    fn close(&mut self) -> Result<()>;
+    fn close(&mut self) -> Result<(), CloseError<()>>;
 }
 pub trait Guard {
     /// Try to release the guard, returning either true for success or false for failure.
@@ -931,7 +944,7 @@ mod tests {
 
     struct TestHandle;
     impl Handle for TestHandle {
-        fn close(&mut self) -> Result<()> {
+        fn close(&mut self) -> Result<(), CloseError<()>> {
             // Who cares about memory leaks in tests anyway?
             Ok(())
         }
