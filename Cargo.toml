@@ -7,6 +7,7 @@ description = "A buffer pool library for Redox, featuring a general-purpose 32-b
 documentation = "https://docs.rs/redox-buffer-pool"
 readme = "README.md"
 homepage = "https://redox-os.org/"
+repository = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git"
 license = "MIT"
 keywords = ["redox", "buffer-pool"]
 categories = ["data-structures", "memory-management"]
