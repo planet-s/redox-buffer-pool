@@ -11,7 +11,6 @@ use std::{cmp, fmt, mem, ops, slice};
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use thiserror::Error;
 
 /// A comparator that only compares the offsets of two ranges.
 struct RangeOffsetComparator;
@@ -843,9 +842,15 @@ pub trait Guard {
     fn try_release(&self) -> bool;
 }
 
-#[derive(Debug, Error)]
-#[error("failed to add guard, due to another guard already existing")]
+#[derive(Debug)]
 pub struct AddGuardError;
+
+impl fmt::Display for AddGuardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to add guard, due to another guard already existing")
+    }
+}
+impl std::error::Error for AddGuardError {}
 
 pub struct WithGuardError<T> {
     pub this: T,
@@ -902,9 +907,15 @@ impl<T> fmt::Debug for CloseError<T> {
             .finish()
     }
 }
-#[derive(Debug, Error)]
-#[error("failed to expand buffer: arithmetic overflow")]
+#[derive(Debug)]
 pub struct BeginExpandError;
+
+impl fmt::Display for BeginExpandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to expand buffer: arithmetic overflow")
+    }
+}
+impl std::error::Error for BeginExpandError {}
 
 #[cfg(feature = "redox")]
 mod libc_error_impls {
