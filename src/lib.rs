@@ -1255,7 +1255,6 @@ mod tests {
         mem::forget(pool);
     }
     #[test]
-    #[ignore]
     fn occ_multithreaded() {
         // This test is not about aliasing, but rather to get all the assertions and expects, to
         // work when there are multiple threads constantly trying to acquire and release slices.
@@ -1295,7 +1294,6 @@ mod tests {
         }
     }
     #[test]
-    #[ignore]
     fn no_aliasing() {
         let (pool, _) = setup_default_pool();
         const SIZE: u32 = 512;
@@ -1315,7 +1313,6 @@ mod tests {
         }
     }
     #[test]
-    #[ignore]
     fn alignment() {
         let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
 
