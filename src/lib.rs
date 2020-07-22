@@ -3,13 +3,13 @@
 
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::TryInto;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{cmp, fmt, mem, ops, slice};
 
 use cranelift_bforest::{Comparator, Map, MapForest};
-use either::*;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 /// A comparator that only compares the offsets of two ranges.
@@ -127,11 +127,12 @@ impl MmapOffsetHalf {
         !self.is_pending()
     }
 }
-impl MmapInfoHalf {
-    const fn null() -> Self {
+impl<E: Copy> MmapInfoHalf<E> {
+    fn null() -> Self {
         Self {
             // reasonable since size == 0 implies _no pointer access at all_
             addr: NonNull::dangling(),
+            extra: MaybeUninit::uninit(),
             size: 0,
         }
     }
@@ -147,16 +148,17 @@ impl Comparator<MmapOffsetHalf> for MmapComparatorOffset {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MmapInfoHalf {
+struct MmapInfoHalf<E: Copy> {
     size: u32,
+    extra: MaybeUninit<E>,
     addr: NonNull<u8>,
 }
 
-struct MmapMap {
-    map: Map<MmapOffsetHalf, MmapInfoHalf>,
-    forest: MapForest<MmapOffsetHalf, MmapInfoHalf>,
+struct MmapMap<E: Copy> {
+    map: Map<MmapOffsetHalf, MmapInfoHalf<E>>,
+    forest: MapForest<MmapOffsetHalf, MmapInfoHalf<E>>,
 }
-pub struct BufferPool<H: Handle> {
+pub struct BufferPool<H: Handle, E: Copy> {
     handle: Option<H>,
 
     // TODO: Concurrent B-tree
@@ -165,14 +167,15 @@ pub struct BufferPool<H: Handle> {
 
     // The map all occupations
     occ_map: RwLock<OccMap>,
-    mmap_map: RwLock<MmapMap>,
+    mmap_map: RwLock<MmapMap<E>>,
 }
-unsafe impl<H: Handle + Send> Send for BufferPool<H> {}
-unsafe impl<H: Handle + Sync> Sync for BufferPool<H> {}
+unsafe impl<H: Send + Handle, E: Copy> Send for BufferPool<H, E> {}
+unsafe impl<H: Sync + Handle, E: Copy> Sync for BufferPool<H, E> {}
 
-impl<H: Handle> fmt::Debug for BufferPool<H>
+impl<H, E> fmt::Debug for BufferPool<H, E>
 where
-    H: fmt::Debug,
+    H: fmt::Debug + Handle,
+    E: Copy,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufferPool")
@@ -192,38 +195,67 @@ impl Guard for NoGuard {
 // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
 // exclusive, while a higher refcount would mean shared.
 #[derive(Debug)]
-pub struct BufferSlice<'a, H: Handle, G: Guard = NoGuard> {
-    start: u32,
-    size: u32,
+pub struct BufferSlice<'a, H: Handle, E: Copy, G: Guard = NoGuard> {
+    alloc_start: u32,
+    alloc_size: u32,
+    mmap_start: u32,
+    mmap_size: u32,
     pointer: *mut u8,
+    extra: E,
 
-    pool: Either<&'a BufferPool<H>, Weak<BufferPool<H>>>,
+    pool: PoolRefKind<'a, H, E>,
     guard: Option<G>,
 }
 
-unsafe impl<'a, H, G: Guard> Send for BufferSlice<'a, H, G>
+#[derive(Debug)]
+enum PoolRefKind<'a, H: Handle, E: Copy> {
+    Ref(&'a BufferPool<H, E>),
+    Strong(Arc<BufferPool<H, E>>),
+    Weak(Weak<BufferPool<H, E>>),
+}
+impl<'a, H: Handle, E: Copy> Clone for PoolRefKind<'a, H, E> {
+    fn clone(&self) -> Self {
+        match *self {
+            Self::Ref(r) => Self::Ref(r),
+            Self::Strong(ref arc) => Self::Strong(Arc::clone(arc)),
+            Self::Weak(ref weak) => Self::Weak(Weak::clone(weak)),
+        }
+    }
+}
+
+unsafe impl<'a, H, E, G> Send for BufferSlice<'a, H, E, G>
 where
     H: Send + Sync + Handle,
-    G: Send,
+    E: Copy + Send,
+    G: Send + Guard,
 {
 }
-unsafe impl<'a, H, G: Guard> Sync for BufferSlice<'a, H, G>
+unsafe impl<'a, H, E, G> Sync for BufferSlice<'a, H, E, G>
 where
     H: Send + Sync + Handle,
-    G: Sync,
+    E: Copy + Sync,
+    G: Sync + Guard,
 {
 }
 
-impl<'a, H, G> BufferSlice<'a, H, G>
+impl<'a, H, E, G> BufferSlice<'a, H, E, G>
 where
-    G: Guard,
     H: Handle,
+    E: Copy,
+    G: Guard,
 {
+    pub fn pool_is_alive(&self) -> bool {
+        match self.pool {
+            PoolRefKind::Weak(ref w) => w.strong_count() > 0,
+            PoolRefKind::Ref(_) | PoolRefKind::Strong(_) => true,
+        }
+    }
+
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.pointer as *const u8, self.size.try_into().unwrap()) }
+        unsafe { slice::from_raw_parts(self.pointer as *const u8, self.alloc_size.try_into().unwrap()) }
     }
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.pointer, self.size.try_into().unwrap()) }
+        unsafe { slice::from_raw_parts_mut(self.pointer, self.alloc_size.try_into().unwrap()) }
     }
     /// Forcefully remove a guard from a future, from this slice, returning it if there was a guard
     /// already.
@@ -238,8 +270,9 @@ where
                 let arc;
 
                 let pool = match self.pool {
-                    Left(reference) => reference,
-                    Right(ref weak) => {
+                    PoolRefKind::Ref(reference) => reference,
+                    PoolRefKind::Strong(ref arc) => &*arc,
+                    PoolRefKind::Weak(ref weak) => {
                         arc = weak.upgrade().expect(
                             "calling unguard on a weakly-owned buffer slice where the pool died",
                         );
@@ -269,11 +302,12 @@ where
         let arc;
 
         let pool = match self.pool {
-            Left(pool) => pool,
-            Right(ref pool_weak) => {
+            PoolRefKind::Ref(pool) => pool,
+            PoolRefKind::Strong(ref arc) => &*arc,
+            PoolRefKind::Weak(ref pool_weak) => {
                 arc = pool_weak
                     .upgrade()
-                    .expect("Guarding buffer slice which pool has been dropped");
+                    .expect("trying to guard weakly-owned buffer slice which pool has been dropped");
                 &*arc
             }
         };
@@ -288,25 +322,28 @@ where
     pub fn with_guard<OtherGuard: Guard>(
         self,
         other: OtherGuard,
-    ) -> Result<BufferSlice<'a, H, OtherGuard>, WithGuardError<Self>> {
+    ) -> Result<BufferSlice<'a, H, E, OtherGuard>, WithGuardError<Self>> {
         if self.guard.is_some() {
             return Err(WithGuardError { this: self });
         }
-        let start = self.start;
+        let alloc_start = self.alloc_start;
+        let alloc_size = self.alloc_size;
+        let mmap_start = self.mmap_start;
+        let mmap_size = self.mmap_size;
         let pointer = self.pointer;
-        let pool = match self.pool {
-            Left(r) => Left(r),
-            Right(ref w) => Right(Weak::clone(w)),
-        };
-        let size = self.size;
+        let pool = self.pool.clone();
+        let extra = self.extra;
 
         mem::forget(self);
 
         let mut slice = BufferSlice {
-            start,
+            alloc_start,
+            alloc_size,
+            mmap_start,
+            mmap_size,
             pointer,
             pool,
-            size,
+            extra,
             guard: None,
         };
         slice.guard(other).unwrap();
@@ -316,8 +353,12 @@ where
         let arc;
 
         let pool = match self.pool {
-            Left(reference) => reference,
-            Right(ref weak) => {
+            PoolRefKind::Ref(reference) => reference,
+            PoolRefKind::Strong(ref aliased_arc) => {
+                arc = Arc::clone(aliased_arc);
+                &*arc
+            }
+            PoolRefKind::Weak(ref weak) => {
                 arc = match weak.upgrade() {
                     Some(a) => a,
                     None => return true,
@@ -356,20 +397,30 @@ where
 
     /// Get the internal offset from the mmap file.
     pub fn offset(&self) -> u32 {
-        self.start
+        self.alloc_start
     }
     /// Get the length of the slice.
     pub fn len(&self) -> u32 {
-        self.size
+        self.alloc_size
     }
     /// Check whether the slice is empty or not.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    pub fn mmap_offset(&self) -> u32 {
+        self.mmap_start
+    }
+    pub fn mmap_size(&self) -> u32 {
+        self.mmap_size
+    }
+    pub fn extra(&self) -> E {
+        self.extra
+    }
 }
-impl<'a, H, G> Drop for BufferSlice<'a, H, G>
+impl<'a, H, E, G> Drop for BufferSlice<'a, H, E, G>
 where
     G: Guard,
+    E: Copy,
     H: Handle,
 {
     fn drop(&mut self) {
@@ -381,44 +432,48 @@ where
         }
     }
 }
-impl<'a, H: Handle, G: Guard> ops::Deref for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> ops::Deref for BufferSlice<'a, H, E, G> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, G: Guard> ops::DerefMut for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> ops::DerefMut for BufferSlice<'a, H, E, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
-impl<'a, H: Handle, G: Guard> Borrow<[u8]> for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> Borrow<[u8]> for BufferSlice<'a, H, E, G> {
     fn borrow(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, G: Guard> BorrowMut<[u8]> for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> BorrowMut<[u8]> for BufferSlice<'a, H, E, G> {
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-impl<'a, H: Handle, G: Guard> AsRef<[u8]> for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> AsRef<[u8]> for BufferSlice<'a, H, E, G> {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, G: Guard> AsMut<[u8]> for BufferSlice<'a, H, G> {
+impl<'a, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, H, E, G> {
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-pub struct ExpandHandle<'a, H: Handle> {
+pub struct ExpandHandle<'a, H: Handle, E: Copy> {
     offset: u32,
     len: u32,
-    pool: &'a BufferPool<H>,
+    pool: &'a BufferPool<H, E>,
 }
-impl<'a, H: Handle> ExpandHandle<'a, H> {
+impl<'a, H, E> ExpandHandle<'a, H, E>
+where
+    H: Handle,
+    E: Copy,
+{
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -433,7 +488,7 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
     /// For this to be safe, the pointer must be a valid allocation (anywhere) of the size
     /// originally inputted. THE POINTER MUST NOT BE NULL, or the rust compiler will execute the
     /// wrong code! TODO: alignment
-    pub unsafe fn initialize(self, pointer: *mut u8) {
+    pub unsafe fn initialize(self, pointer: *mut u8, extra: E) {
         let mut write_guard = self.pool.mmap_map.write();
         let mmap_map = &mut *write_guard;
 
@@ -443,6 +498,7 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
         let new_info_half = MmapInfoHalf {
             addr: NonNull::new_unchecked(pointer as *const u8 as *mut u8),
             size: self.len(),
+            extra: MaybeUninit::new(extra),
         };
 
         // Remove the previous entry marked "pending", and insert a new entry marked "ready".
@@ -451,11 +507,12 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
             .remove(old_offset_half, &mut mmap_map.forest, &())
             .expect("pending mmap range was not ");
 
-        mmap_map.map
-            .insert(new_offset_half, new_info_half, &mut mmap_map.forest, &())
-            .expect_none(
+        if mmap_map.map
+            .insert(new_offset_half, new_info_half, &mut mmap_map.forest, &()).is_some() {
+            panic!(
                 "somehow the mmap range that was supposed to go from \"pending\" to \"ready\", was already inserted as \"ready\""
             );
+        }
 
         // Before releasing the guard and allowing new slices from be acquired, we'll do a last
         // lock of the occ map, to mark the range as free.
@@ -482,8 +539,12 @@ impl<'a, H: Handle> ExpandHandle<'a, H> {
             .expect_none("expected newly-acquired slice not to conflict with any existing");
     }
 }
-impl<H: Handle> BufferPool<H> {
-    pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H>, BeginExpandError> {
+impl<H, E> BufferPool<H, E>
+where
+    H: Handle,
+    E: Copy,
+{
+    pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H, E>, BeginExpandError> {
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
             // readers to continue acquiring new slices etc, but only allows this thread to be able
@@ -577,7 +638,11 @@ impl<H: Handle> BufferPool<H> {
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
     }
-    fn acquire_slice(&self, len: u32, alignment: u32) -> Option<(ops::Range<u32>, *mut u8)> {
+    // Tries to acquire a buffer slice by inserting an occupied entry into the occ map. The buffer
+    // slice must not be able to span multi mmaps, since their base pointers won't be contiguous.
+    // Returns the range of new newly occupied entry, the range of that entry's mmap, the base
+    // pointer of that entry's mmap, and the extra data associated with the mmap.
+    fn acquire_slice(&self, len: u32, alignment: u32) -> Option<(ops::Range<u32>, ops::Range<u32>, *mut u8, E)> {
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
         // threads checking whether it's safe to munmap certain offsets.
@@ -654,7 +719,7 @@ impl<H: Handle> BufferPool<H> {
 
             new_offset
         };
-        let pointer = {
+        let (mmap_range, pointer, extra) = {
             let read_guard = self.mmap_map.read();
             let (mmap_k, mmap_v) = read_guard
                 .map
@@ -667,51 +732,77 @@ impl<H: Handle> BufferPool<H> {
                     "expected all free entries in the occ map to have a corresponding mmap entry",
                 );
 
+            let mmap_start = mmap_k.offset();
+            let mmap_size = mmap_v.size;
+            let mmap_end = mmap_start.checked_add(mmap_size).expect("expected mmap end not to overflow u32::max_value()");
+
             assert!(mmap_k.is_ready());
-            assert!(mmap_k.offset() <= new_offset);
-            assert!(mmap_k.offset() + mmap_v.size >= new_offset + len);
-            let base_pointer = mmap_v.addr;
-            unsafe {
-                base_pointer
-                    .as_ptr()
-                    .add((new_offset - mmap_k.offset()).try_into().unwrap())
-                    as *mut u8
-            }
+            assert!(mmap_start <= new_offset);
+            assert!(mmap_end >= new_offset + len);
+
+            let (extra, pointer) = unsafe {
+                assert_ne!(mmap_v.size, 0, "expected found slice to not have size zero");
+
+                // SAFETY: The following assumption is safe, because the size field is what acts
+                // like a tag. Since a real allocation can never have zero size, that zero is
+                // instead used to mark the pointer and extra as initialized. The previous
+                // assertation proves that the mmap *really* is initialized.
+                let extra = mmap_v.extra.assume_init();
+
+                // SAFETY: Here, we're still manipulating a raw pointer, so there wouldn't really
+                // be unsoundness apart from a possible overflow, but it's also otherwise safe
+                // because we have asserted that the length is nonzero.
+                let base_pointer = mmap_v.addr;
+                let pointer = 
+                    base_pointer
+                        .as_ptr()
+                        .add((new_offset - mmap_k.offset()).try_into().unwrap())
+                        as *mut u8;
+
+                (extra, pointer)
+            };
+            (mmap_start..mmap_end, pointer, extra)
         };
 
         let offset = aligned_off;
 
-        Some((offset..offset + len, pointer))
+        Some((offset..offset + len, mmap_range, pointer, extra))
+    }
+    fn construct_buffer_slice<G: Guard>(alloc_range: ops::Range<u32>, mmap_range: ops::Range<u32>, pointer: *mut u8, extra: E, pool: PoolRefKind<H, E>) -> BufferSlice<'_, H, E, G> {
+        BufferSlice {
+            alloc_start: alloc_range.start,
+            alloc_size: alloc_range.end - alloc_range.start,
+            mmap_start: mmap_range.start,
+            mmap_size: mmap_range.end - mmap_range.start,
+            pointer,
+            pool,
+            extra,
+            guard: None,
+        }
     }
     pub fn acquire_borrowed_slice<G: Guard>(
         &self,
         len: u32,
         alignment: u32,
-    ) -> Option<BufferSlice<'_, H, G>> {
-        let (range, pointer) = self.acquire_slice(len, alignment)?;
-
-        Some(BufferSlice {
-            start: range.start,
-            size: range.end - range.start,
-            pointer,
-            pool: Left(self),
-            guard: None,
-        })
+    ) -> Option<BufferSlice<'_, H, E, G>> {
+        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Ref(self)))
     }
     pub fn acquire_weak_slice<G: Guard>(
         self: &Arc<Self>,
         len: u32,
         alignment: u32,
-    ) -> Option<BufferSlice<'static, H, G>> {
-        let (range, pointer) = self.acquire_slice(len, alignment)?;
-
-        Some(BufferSlice {
-            start: range.start,
-            size: range.end - range.start,
-            pointer,
-            pool: Right(Arc::downgrade(self)),
-            guard: None,
-        })
+    ) -> Option<BufferSlice<'static, H, E, G>> {
+        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Weak(Arc::downgrade(self))))
+    }
+    pub fn acquire_strong_slice<G: Guard>(
+        self: &Arc<Self>,
+        len: u32,
+        alignment: u32,
+    ) -> Option<BufferSlice<'static, H, E, G>> {
+        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Strong(Arc::clone(self))))
     }
     fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
         let previous_start = *start;
@@ -783,22 +874,22 @@ impl<H: Handle> BufferPool<H> {
         }
     }
 
-    unsafe fn reclaim_slice_inner<G: Guard>(&self, slice: &BufferSlice<'_, H, G>) {
+    unsafe fn reclaim_slice_inner<G: Guard>(&self, slice: &BufferSlice<'_, H, E, G>) {
         let mut occ_write_guard = self.occ_map.write();
         let occ_map = &mut *occ_write_guard;
 
-        let mut start = slice.start;
-        let mut size = slice.size;
+        let mut start = slice.alloc_start;
+        let mut size = slice.alloc_size;
 
         let v = occ_map
             .map
             .remove(
-                OccOffsetHalf::used(slice.start),
+                OccOffsetHalf::used(slice.alloc_start),
                 &mut occ_map.forest,
                 &RangeOffsetComparator,
             )
             .expect("expected occ map to contain buffer slice when reclaiming it");
-        assert_eq!(v.size, slice.size);
+        assert_eq!(v.size, slice.alloc_size);
 
         while Self::remove_free_offset_below(occ_map, &mut start, &mut size) {}
         while Self::remove_free_offset_above(occ_map, &mut start, &mut size) {}
@@ -828,7 +919,7 @@ impl<H: Handle> BufferPool<H> {
     }
 }
 
-impl<H: Handle> Drop for BufferPool<H> {
+impl<H: Handle, E: Copy> Drop for BufferPool<H, E> {
     fn drop(&mut self) {
         self.drop_impl();
     }
@@ -966,7 +1057,7 @@ mod tests {
         }
     }
 
-    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool<TestHandle>, u32) {
+    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool<TestHandle, ()>, u32) {
         let mut mmap_map = MmapMap {
             map: Map::new(),
             forest: MapForest::new(),
@@ -988,6 +1079,7 @@ mod tests {
                 MmapInfoHalf {
                     size,
                     addr: NonNull::new(addr).unwrap().into(),
+                    extra: MaybeUninit::new(()),
                 },
                 &mut mmap_map.forest,
                 &(),
@@ -1008,7 +1100,7 @@ mod tests {
         };
         (pool, total_size)
     }
-    fn setup_default_pool() -> (BufferPool<TestHandle>, u32) {
+    fn setup_default_pool() -> (BufferPool<TestHandle, ()>, u32) {
         setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]])
     }
 
@@ -1096,11 +1188,11 @@ mod tests {
         let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
 
         fn get_and_check_slice(
-            pool: &BufferPool<TestHandle>,
+            pool: &BufferPool<TestHandle, ()>,
             size: u32,
             align: u32,
             fill_byte: u8,
-        ) -> BufferSlice<TestHandle> {
+        ) -> BufferSlice<TestHandle, ()> {
             let mut slice = pool.acquire_borrowed_slice(size, align).unwrap();
             assert!(slice.iter().all(|&byte| byte == 0));
             slice.fill(fill_byte);

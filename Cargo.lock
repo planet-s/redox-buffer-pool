@@ -161,7 +161,6 @@ name = "redox-buffer-pool"
 version = "0.1.0"
 dependencies = [
  "cranelift-bforest",
- "either",
  "log",
  "parking_lot",
  "rand",
