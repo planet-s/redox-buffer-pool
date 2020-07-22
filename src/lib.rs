@@ -1,3 +1,16 @@
+//! # `redox-buffer-pool`
+//!
+//! This crate provides a buffer pool for general-purpose memory management, with support for
+//! allocating slices within the pool, as well as expanding the pool with potentially non-adjacent
+//! larger underlying memory allocations, like _mmap(2)_ or other larger possible page-sized
+//! allocations.
+//!
+//! The current allocator uses one B-trees to partition the space into regions either marked as
+//! occupied or free. The keys used by the B-tree have a custom comparator, which ensures that
+//! keys for used ranges are orderered after the keys for free ranges. This makes acquiring buffer
+//! slices O(log n) (TODO: Make this O(log n) rather than O(n)).
+
+#![deny(missing_docs)]
 #![feature(option_expect_none)]
 #![cfg_attr(test, feature(slice_fill, vec_into_raw_parts))]
 
@@ -158,6 +171,8 @@ struct MmapMap<E: Copy> {
     map: Map<MmapOffsetHalf, MmapInfoHalf<E>>,
     forest: MapForest<MmapOffsetHalf, MmapInfoHalf<E>>,
 }
+/// A buffer pool, featuring a general-purpose 32-bit allocator, and slice guards.
+// TODO: Expand doc
 pub struct BufferPool<H: Handle, E: Copy> {
     handle: Option<H>,
 
@@ -185,6 +200,7 @@ where
     }
 }
 
+/// A no-op guard, that cannot be initialized but still useful in type contexts..
 pub enum NoGuard {}
 impl Guard for NoGuard {
     fn try_release(&self) -> bool {
@@ -195,6 +211,7 @@ impl Guard for NoGuard {
 // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
 // exclusive, while a higher refcount would mean shared.
 #[derive(Debug)]
+/// A slice from the buffer pool, that can be read from or written to as a regular smart pointer.
 pub struct BufferSlice<'a, H: Handle, E: Copy, G: Guard = NoGuard> {
     alloc_start: u32,
     alloc_size: u32,
@@ -244,6 +261,13 @@ where
     E: Copy,
     G: Guard,
 {
+    /// Checks whether the pool that owns this slice is still alive, or if it has dropped. Note
+    /// that this only makes sense for weak buffer slices, since buffer slices tied to a lifetime
+    /// cannot outlive their pools (checked for at compile time), while strong buffer slices ensure
+    /// at runtime that they outlive their pools.
+    ///
+    /// For weak buffer slices, this method should be called before doing anything with the slice,
+    /// since a single deref could make it panic if the buffer isn't there anymore.
     pub fn pool_is_alive(&self) -> bool {
         match self.pool {
             PoolRefKind::Weak(ref w) => w.strong_count() > 0,
@@ -251,11 +275,41 @@ where
         }
     }
 
+    /// Construct an immutable slice from this buffer.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if this is a weak slice, and the buffer pool has been destroyed..
     pub fn as_slice(&self) -> &[u8] {
+        assert!(self.pool_is_alive());
         unsafe { slice::from_raw_parts(self.pointer as *const u8, self.alloc_size.try_into().unwrap()) }
     }
+    /// Tries to construct an immutable slice from this buffer, returning None if the pool has been
+    /// dropped (and hence, this is a weak slice).
+    pub fn try_as_slice(&self) -> Option<&[u8]> {
+        if self.pool_is_alive() {
+            Some(self.as_slice())
+        } else {
+            None
+        }
+    }
+    /// Construct a mutable slice from this buffer.
+    ///
+    /// # Panics
+    ///
+    /// Like [`as_slice`], this method will panic if the buffer pool has been destroyed.
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        assert!(self.pool_is_alive());
         unsafe { slice::from_raw_parts_mut(self.pointer, self.alloc_size.try_into().unwrap()) }
+    }
+    /// Tries to construct a mutable slice from this buffer, returning None if the pool has been
+    /// destroyed.
+    pub fn try_as_slice_mut(&mut self) -> Option<&mut [u8]> {
+        if self.pool_is_alive() {
+            Some(self.as_slice_mut())
+        } else {
+            None
+        }
     }
     /// Forcefully remove a guard from a future, from this slice, returning it if there was a guard
     /// already.
@@ -383,7 +437,7 @@ where
         }
     }
     /// Reclaim the buffer slice, equivalent to dropping but with a Result. If the buffer slice was
-    /// guarded by a future, this will fail with [`EADDRINUSE`] if the future hadn't completed when
+    /// guarded by a future, this will fail with [`ReclaimError`] if the future hadn't completed when
     /// this was called.
     pub fn reclaim(mut self) -> Result<(), ReclaimError<Self>> {
         match self.reclaim_inner() {
@@ -395,11 +449,11 @@ where
         }
     }
 
-    /// Get the internal offset from the mmap file.
+    /// Get the offset of the buffer pool where this was allocated.
     pub fn offset(&self) -> u32 {
         self.alloc_start
     }
-    /// Get the length of the slice.
+    /// Get the length of the allocation slice.
     pub fn len(&self) -> u32 {
         self.alloc_size
     }
@@ -407,12 +461,16 @@ where
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Get the offset of the underlying possibly non-contiguously-organized mmap, that was added
+    /// as part of [`BufferPool::expand`].
     pub fn mmap_offset(&self) -> u32 {
         self.mmap_start
     }
+    /// Get the size of the mmap region this slice was allocated in.
     pub fn mmap_size(&self) -> u32 {
         self.mmap_size
     }
+    /// Get the extra field from the mmap region this slice belongs to, copied.
     pub fn extra(&self) -> E {
         self.extra
     }
@@ -464,6 +522,9 @@ impl<'a, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, H, E, G> 
         self.as_slice_mut()
     }
 }
+/// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
+/// method, the range has already been reserved, so it's up to this handle to initialize it.
+// TODO: Reclaim pending slice upon Drop or a fallible cancel method.
 pub struct ExpandHandle<'a, H: Handle, E: Copy> {
     offset: u32,
     len: u32,
@@ -474,9 +535,16 @@ where
     H: Handle,
     E: Copy,
 {
+    /// Get the length of the range that has been reserved for this specific allocation.
     pub fn len(&self) -> u32 {
         self.len
     }
+    /// Check whether the pending expansion consists of no bytes. Note that zero-sized allocations
+    /// will panic anyways, so this will always return false, but is still there for completeness.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Get the offset within the buffer pool, where this allocation is to take place.
     pub fn offset(&self) -> u32 {
         self.offset
     }
@@ -544,6 +612,12 @@ where
     H: Handle,
     E: Copy,
 {
+    /// Begin a buffer pool expansion, by reserving a new not-yet-usable "pending" mmap region.
+    /// Internally, this will use an intent lock, so while there can be multiple parallel
+    /// expansions in the actual allocation phase, the process of finding a new range within the
+    /// pool for allocation, can only have one writer at a time. That said, readers of this pool
+    /// will still be able to function correctly, and the only critical exclusive section, is only
+    /// to insert the new range into the pool.
     pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H, E>, BeginExpandError> {
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
@@ -605,6 +679,7 @@ where
 
     // TODO: Shrink support
 
+    /// Retrieve the user "handle" that was passed to this buffer pool at initialization.
     pub fn handle(&self) -> Option<&H> {
         self.handle.as_ref()
     }
@@ -620,6 +695,8 @@ where
         let handle = self.handle.take();
         Ok(handle)
     }
+    /// Create a new empty buffer pool, using an optional user "handle" that is stored together
+    /// with the rest of the pool.
     pub fn new(handle: Option<H>) -> Self {
         Self {
             occ_map: RwLock::new(OccMap {
@@ -661,6 +738,7 @@ where
                 .checked_mul(alignment)
         }
 
+        // TODO: Use a better B-tree to prevent O(n) allocation.
         let (k, _) = intent_guard.map.iter(&intent_guard.forest).find(|(k, v)| {
             k.is_free()
                 && v.size >= len
@@ -780,6 +858,11 @@ where
             guard: None,
         }
     }
+    /// Try to acquire a statically (as in compiler-checked and lifetime-tied) borrowed slice, from
+    /// this buffer. The slice will automatically be reclaimed upon drop, so long as there is no
+    /// guard protecting the slice at that time. If there is, the memory will be leaked instead,
+    /// and the pool will not be able to use the offset, as it will be marked "occpied" and nothing
+    /// will free it.
     pub fn acquire_borrowed_slice<G: Guard>(
         &self,
         len: u32,
@@ -788,6 +871,12 @@ where
         let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
         Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Ref(self)))
     }
+    /// Try to acquire a weakly-borrowed ([`std::sync::Weak`]) slice, that may outlive this buffer
+    /// pool. If that would happen, most functionality of the slice would cause it to panic,
+    /// although this can be checked for as well.
+    ///
+    /// These slices can also be guarded, see [`acquire_borrowed_slice`] for a detailed explanation
+    /// of that.
     pub fn acquire_weak_slice<G: Guard>(
         self: &Arc<Self>,
         len: u32,
@@ -796,6 +885,11 @@ where
         let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
         Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Weak(Arc::downgrade(self))))
     }
+    /// Try to acquire a strongly-borrowed ([`std::sync::Arc`]) slice, that ensures this buffer
+    /// pool cannot be outlived by preventing the pool from being dropped.
+    ///
+    /// These slices can also be guarded, see [`acquire_borrowed_slice`] for a detailed explanation
+    /// of that.
     pub fn acquire_strong_slice<G: Guard>(
         self: &Arc<Self>,
         len: u32,
@@ -910,7 +1004,7 @@ where
         let count = self.guarded_occ_count.load(Ordering::Acquire);
 
         if count == 0 {
-            if let Some(h) = self.handle.as_mut() {
+            if let Some(h) = self.handle.take() {
                 let _ = h.close();
             }
         } else {
@@ -925,14 +1019,29 @@ impl<H: Handle, E: Copy> Drop for BufferPool<H, E> {
     }
 }
 
+/// The requirement of a handle to be able to be passed into the buffer pool.
 pub trait Handle {
-    fn close(&mut self) -> Result<(), CloseError<()>>;
+    /// The only requirement for a handle, is that the handle should provide this method to allow
+    /// closing the underlying memory, if that memory came from this handle.
+    ///
+    /// This method is optional to implement; it's completely ok to simply return `Ok(())` here.
+    fn close(self) -> Result<(), CloseError<()>>;
 }
+/// The requirement of a guard to a slice. Guards can optionally prevent slices from being
+/// reclaimed; the slices have a fallible [`BufferSlice::reclaim`] method, but their `Drop` impl
+/// will cause the memory to leak if it's still protected by the guard. This is especially useful
+/// when the buffers are shared with another process (`io_uring` for instance), or by hardware,
+/// since this prevents data races that could occur, if a new buffer for a different purpose
+/// happens to use the same memory as an old buffer that hardware e.g. thinks it can write to.
 pub trait Guard {
     /// Try to release the guard, returning either true for success or false for failure.
     fn try_release(&self) -> bool;
 }
 
+/// The potential error from [`BufferSlice::guard`], indicating that a different guard is already
+/// present.
+///
+/// This error corresponds to `EEXIST` if the `redox` feature is enabled.
 #[derive(Debug)]
 pub struct AddGuardError;
 
@@ -943,7 +1052,13 @@ impl fmt::Display for AddGuardError {
 }
 impl std::error::Error for AddGuardError {}
 
+/// The potential error from [`Bufferslice::with_guard`], indicating that a different guard is
+/// already in use by the the buffer slice. Since that method takes self by value, the old self is
+/// included here, to allow for reuse in case of failure.
+///
+/// Like the [`AddGuardError`], this corresponds to `EEXIST` if the `redox` feature is enabled.
 pub struct WithGuardError<T> {
+    /// The self passed by value that could have it's guard type replaced.
     pub this: T,
 }
 impl<T> fmt::Debug for WithGuardError<T> {
@@ -968,7 +1083,11 @@ impl<T> From<WithGuardError<T>> for AddGuardError {
         Self
     }
 }
+/// The potential error from [`BufferSlice::reclaim`], caused by the slice being guarded.
+///
+/// This error is convertible to `EADDRINUSE`, if the `redox` feature is enabled.
 pub struct ReclaimError<T> {
+    /// The slice that couldn't be reclaimed, due to an active guard.
     pub this: T,
 }
 impl<T> fmt::Display for ReclaimError<T> {
@@ -983,7 +1102,13 @@ impl<T> fmt::Debug for ReclaimError<T> {
 }
 impl<T> std::error::Error for ReclaimError<T> {}
 
+/// The error from [`BufferPool::close`], meaning that there is currently a guarded buffer slice in
+/// use by the pool, preventing resource freeing.
+///
+/// As with [`ReclaimError`], this error is convertible to `EADDRINUSE` in case the `redox` feature
+/// is enabled.
 pub struct CloseError<T> {
+    /// The buffer pool that couldn't be destroyed.
     pub this: T,
 }
 impl<T> fmt::Display for CloseError<T> {
@@ -998,12 +1123,16 @@ impl<T> fmt::Debug for CloseError<T> {
             .finish()
     }
 }
+/// The error internally caused by arithmetic overflow, that indicates the buffer pool has no more
+/// usable ranges.
+///
+/// This error can be converted into `ENOMEM` if the `redox` feature is enabled.
 #[derive(Debug)]
 pub struct BeginExpandError;
 
 impl fmt::Display for BeginExpandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to expand buffer: arithmetic overflow")
+        write!(f, "failed to expand buffer: no more buffer pool memory (arithmetic overflow)")
     }
 }
 impl std::error::Error for BeginExpandError {}
@@ -1051,7 +1180,7 @@ mod tests {
 
     struct TestHandle;
     impl Handle for TestHandle {
-        fn close(&mut self) -> Result<(), CloseError<()>> {
+        fn close(self) -> Result<(), CloseError<()>> {
             // Who cares about memory leaks in tests anyway?
             Ok(())
         }
@@ -1126,6 +1255,7 @@ mod tests {
         mem::forget(pool);
     }
     #[test]
+    #[ignore]
     fn occ_multithreaded() {
         // This test is not about aliasing, but rather to get all the assertions and expects, to
         // work when there are multiple threads constantly trying to acquire and release slices.
@@ -1165,6 +1295,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore]
     fn no_aliasing() {
         let (pool, _) = setup_default_pool();
         const SIZE: u32 = 512;
@@ -1184,6 +1315,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore]
     fn alignment() {
         let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
 
