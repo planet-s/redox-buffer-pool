@@ -282,7 +282,12 @@ where
     /// This method will panic if this is a weak slice, and the buffer pool has been destroyed..
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.pool_is_alive());
-        unsafe { slice::from_raw_parts(self.pointer as *const u8, self.alloc_size.try_into().unwrap()) }
+        unsafe {
+            slice::from_raw_parts(
+                self.pointer as *const u8,
+                self.alloc_size.try_into().unwrap(),
+            )
+        }
     }
     /// Tries to construct an immutable slice from this buffer, returning None if the pool has been
     /// dropped (and hence, this is a weak slice).
@@ -359,9 +364,9 @@ where
             PoolRefKind::Ref(pool) => pool,
             PoolRefKind::Strong(ref arc) => &*arc,
             PoolRefKind::Weak(ref pool_weak) => {
-                arc = pool_weak
-                    .upgrade()
-                    .expect("trying to guard weakly-owned buffer slice which pool has been dropped");
+                arc = pool_weak.upgrade().expect(
+                    "trying to guard weakly-owned buffer slice which pool has been dropped",
+                );
                 &*arc
             }
         };
@@ -575,8 +580,11 @@ where
             .remove(old_offset_half, &mut mmap_map.forest, &())
             .expect("pending mmap range was not ");
 
-        if mmap_map.map
-            .insert(new_offset_half, new_info_half, &mut mmap_map.forest, &()).is_some() {
+        if mmap_map
+            .map
+            .insert(new_offset_half, new_info_half, &mut mmap_map.forest, &())
+            .is_some()
+        {
             panic!(
                 "somehow the mmap range that was supposed to go from \"pending\" to \"ready\", was already inserted as \"ready\""
             );
@@ -618,7 +626,10 @@ where
     /// pool for allocation, can only have one writer at a time. That said, readers of this pool
     /// will still be able to function correctly, and the only critical exclusive section, is only
     /// to insert the new range into the pool.
-    pub fn begin_expand(&self, additional: u32) -> Result<ExpandHandle<'_, H, E>, BeginExpandError> {
+    pub fn begin_expand(
+        &self,
+        additional: u32,
+    ) -> Result<ExpandHandle<'_, H, E>, BeginExpandError> {
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
             // readers to continue acquiring new slices etc, but only allows this thread to be able
@@ -719,7 +730,11 @@ where
     // slice must not be able to span multi mmaps, since their base pointers won't be contiguous.
     // Returns the range of new newly occupied entry, the range of that entry's mmap, the base
     // pointer of that entry's mmap, and the extra data associated with the mmap.
-    fn acquire_slice(&self, len: u32, alignment: u32) -> Option<(ops::Range<u32>, ops::Range<u32>, *mut u8, E)> {
+    fn acquire_slice(
+        &self,
+        len: u32,
+        alignment: u32,
+    ) -> Option<(ops::Range<u32>, ops::Range<u32>, *mut u8, E)> {
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
         // threads checking whether it's safe to munmap certain offsets.
@@ -812,7 +827,9 @@ where
 
             let mmap_start = mmap_k.offset();
             let mmap_size = mmap_v.size;
-            let mmap_end = mmap_start.checked_add(mmap_size).expect("expected mmap end not to overflow u32::max_value()");
+            let mmap_end = mmap_start
+                .checked_add(mmap_size)
+                .expect("expected mmap end not to overflow u32::max_value()");
 
             assert!(mmap_k.is_ready());
             assert!(mmap_start <= new_offset);
@@ -831,11 +848,10 @@ where
                 // be unsoundness apart from a possible overflow, but it's also otherwise safe
                 // because we have asserted that the length is nonzero.
                 let base_pointer = mmap_v.addr;
-                let pointer = 
-                    base_pointer
-                        .as_ptr()
-                        .add((new_offset - mmap_k.offset()).try_into().unwrap())
-                        as *mut u8;
+                let pointer = base_pointer
+                    .as_ptr()
+                    .add((new_offset - mmap_k.offset()).try_into().unwrap())
+                    as *mut u8;
 
                 (extra, pointer)
             };
@@ -846,7 +862,13 @@ where
 
         Some((offset..offset + len, mmap_range, pointer, extra))
     }
-    fn construct_buffer_slice<G: Guard>(alloc_range: ops::Range<u32>, mmap_range: ops::Range<u32>, pointer: *mut u8, extra: E, pool: PoolRefKind<H, E>) -> BufferSlice<'_, H, E, G> {
+    fn construct_buffer_slice<G: Guard>(
+        alloc_range: ops::Range<u32>,
+        mmap_range: ops::Range<u32>,
+        pointer: *mut u8,
+        extra: E,
+        pool: PoolRefKind<H, E>,
+    ) -> BufferSlice<'_, H, E, G> {
         BufferSlice {
             alloc_start: alloc_range.start,
             alloc_size: alloc_range.end - alloc_range.start,
@@ -869,7 +891,13 @@ where
         alignment: u32,
     ) -> Option<BufferSlice<'_, H, E, G>> {
         let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
-        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Ref(self)))
+        Some(Self::construct_buffer_slice(
+            alloc_range,
+            mmap_range,
+            pointer,
+            extra,
+            PoolRefKind::Ref(self),
+        ))
     }
     /// Try to acquire a weakly-borrowed ([`std::sync::Weak`]) slice, that may outlive this buffer
     /// pool. If that would happen, most functionality of the slice would cause it to panic,
@@ -883,7 +911,13 @@ where
         alignment: u32,
     ) -> Option<BufferSlice<'static, H, E, G>> {
         let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
-        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Weak(Arc::downgrade(self))))
+        Some(Self::construct_buffer_slice(
+            alloc_range,
+            mmap_range,
+            pointer,
+            extra,
+            PoolRefKind::Weak(Arc::downgrade(self)),
+        ))
     }
     /// Try to acquire a strongly-borrowed ([`std::sync::Arc`]) slice, that ensures this buffer
     /// pool cannot be outlived by preventing the pool from being dropped.
@@ -896,7 +930,13 @@ where
         alignment: u32,
     ) -> Option<BufferSlice<'static, H, E, G>> {
         let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
-        Some(Self::construct_buffer_slice(alloc_range, mmap_range, pointer, extra, PoolRefKind::Strong(Arc::clone(self))))
+        Some(Self::construct_buffer_slice(
+            alloc_range,
+            mmap_range,
+            pointer,
+            extra,
+            PoolRefKind::Strong(Arc::clone(self)),
+        ))
     }
     fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
         let previous_start = *start;
@@ -1047,7 +1087,10 @@ pub struct AddGuardError;
 
 impl fmt::Display for AddGuardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to add guard, due to another guard already existing")
+        write!(
+            f,
+            "failed to add guard, due to another guard already existing"
+        )
     }
 }
 impl std::error::Error for AddGuardError {}
@@ -1132,7 +1175,10 @@ pub struct BeginExpandError;
 
 impl fmt::Display for BeginExpandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to expand buffer: no more buffer pool memory (arithmetic overflow)")
+        write!(
+            f,
+            "failed to expand buffer: no more buffer pool memory (arithmetic overflow)"
+        )
     }
 }
 impl std::error::Error for BeginExpandError {}
