@@ -6,7 +6,7 @@ rust-nightly:
   image: rustlang/rust:nightly
   before_script:
     - rustup component add clippy --toolchain=nightly || cargo install --git https://github.com/rust-lang/rust-clippy/ --force clippy
-    - rustup component add rustfmt-preview --toolchain=nightly
+    - rustup component add rustfmt-preview --toolchain=nightly || true
   script:
     - cargo build --verbose
     - cargo test --verbose
