@@ -1053,10 +1053,13 @@ where
                 let item = free_map
                     .range(FreeEntry::from_size_offset(len, alignment)..)
                     .next()?;
+
+                let check_if_misalignment_would_work =
+                    |aligned| item.size() - (aligned - item.offset()) >= len;
+
                 if item.size() >= len
-                    && align(item.offset(), alignment).map_or(false, |aligned| {
-                        item.size() - (aligned - item.offset()) >= len
-                    })
+                    && align(item.offset(), alignment)
+                        .map_or(false, check_if_misalignment_would_work)
                 {
                     Some(item)
                 } else {
