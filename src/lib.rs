@@ -81,25 +81,6 @@ pub unsafe trait Integer:
     + ops::BitXor<Self, Output = Self>
 {
 }
-fn free_space_align_width<I: Integer>() -> u32 {
-    let bit_count = mem::size_of::<I>() * 8;
-    // Assuming that the size is a power of two, this will give the number of bits can are used to
-    // describe the number of bits of the size itself.
-    bit_count.trailing_zeros()
-}
-fn free_space_align_shift<I: Integer>() -> u32 {
-    (mem::size_of::<I>() * 8) as u32 - free_space_align_width::<I>()
-}
-fn free_space_align_mask<I: Integer>() -> I {
-    (!I::zero()) ^ ((I::from(1u8) << free_space_align_shift::<I>()) - I::from(1u8))
-}
-fn free_space_size_shift<I: Integer>() -> u32 {
-    0
-}
-fn free_space_size_mask<I: Integer>() -> I {
-    !free_space_align_mask::<I>()
-}
-
 fn occ_map_ready_shift<I: Integer>() -> u32 {
     let bit_count = (mem::size_of::<I>() * 8) as u32;
     bit_count - 1
@@ -166,9 +147,6 @@ impl<I: Integer> Size<I> {
     }
     fn from_size(size: I) -> Self {
         Self(size)
-    }
-    fn set_size(&mut self, size: I) {
-        self.0 = size;
     }
 }
 
@@ -295,20 +273,90 @@ impl<I, E: Copy> MmapInfo<I, E> {
     }
 }
 
-struct BufferPoolOptions<I> {
-    log2_minimum_alignment: I,
-    log2_maximum_alignment: I,
 
-    // The minimum size doesn't make sense, as the minimum alignment is the one that forces sizes
-    // not to get uneven.
+/// Various options used by the buffer pool mainly to limit the range of possible sizes and
+/// alignments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct BufferPoolOptions<I> {
+    log2_minimum_alignment: u8,
+    log2_maximum_alignment: u8,
+
+    minimum_size: I,
     maximum_size: I,
 }
+impl<I: Integer> BufferPoolOptions<I> {
+    /// Use the default buffer pool options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Set the maximum possible alignment, causing allocations with larger alignments to fail
+    /// immediately. This will also override the minimum possible alignment, if this would happen
+    /// to be smaller than that.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the alignment is not a valid power of two, or if it's zero.
+    pub fn with_maximum_alignment(mut self, alignment: I) -> Self {
+        assert!(alignment.is_power_of_two());
+        assert_ne!(alignment, I::zero());
+
+        let log2_align = alignment.trailing_zeros();
+        self.log2_maximum_alignment = log2_align.try_into().unwrap();
+        self.log2_minimum_alignment = std::cmp::min(self.log2_minimum_alignment, self.log2_maximum_alignment);
+        self
+    }
+    /// Reduce the minimum alignment to 1.
+    pub fn with_no_minimum_alignment(self) -> Self {
+        self.with_minimum_alignment(I::from(1u8))
+    }
+    /// Set the minimum possible alignment, causing allocations with smaller alignments to use this
+    /// alignment instead. This will override the maximum alignment, if this were to be larger than
+    /// that.
+    ///
+    /// # Panics
+    /// This method will panic if the alignment is not a power of two, or if it's zero.
+    pub fn with_minimum_alignment(mut self, alignment: I) -> Self {
+        assert!(alignment.is_power_of_two());
+        assert_ne!(alignment, I::zero());
+
+        let log2_align = alignment.trailing_zeros();
+        self.log2_minimum_alignment = log2_align.try_into().unwrap();
+        self.log2_maximum_alignment = std::cmp::max(self.log2_maximum_alignment, self.log2_maximum_alignment);
+
+        self
+    }
+    /// Allow all possible alignments when allocating.
+    pub fn with_no_maximum_alignment(self) -> Self {
+        self.with_maximum_alignment(I::from((mem::size_of::<I>() * 8 - 1) as u8))
+    }
+    /// Set the maximum size that allocations can have.
+    pub fn with_maximum_size(mut self, size: I) -> Self {
+        self.maximum_size = size;
+        self.minimum_size = std::cmp::min(self.minimum_size, self.maximum_size);
+        self
+    }
+    /// Set the minimum size that allocations can have. While this will not affect the lengths of
+    /// the buffer slices, it will round their capacities up to this number, giving them extra
+    /// space that they can optionally expand to.
+    pub fn with_minimum_size(mut self, size: I) -> Self {
+        self.minimum_size = size;
+        self.maximum_size = std::cmp::max(self.minimum_size, self.maximum_size);
+        self
+    }
+}
+
 impl<I: Integer> Default for BufferPoolOptions<I> {
     fn default() -> Self {
+        let log2_minimum_alignment = mem::align_of::<usize>() as u8;
+        let log2_maximum_alignment = (mem::size_of::<I>() * 8 - 1) as u8;
+
         Self {
-            log2_minimum_alignment: I::zero(),
-            log2_maximum_alignment: I::MAX,
-            maximum_size: I::from(1u8) << free_space_size_shift::<I>(),
+            // Default to system alignment for usize.
+            log2_minimum_alignment,
+            // Default to unlimited. TODO
+            log2_maximum_alignment: std::cmp::max(log2_minimum_alignment, log2_maximum_alignment),
+            maximum_size: I::MAX,
+            minimum_size: I::from(1u8),
         }
     }
 }
@@ -772,6 +820,32 @@ where
         assert!(updated);
     }
 }
+/// The strategy to use when allocating, with tradeoffs between heap fragmentation, and the
+/// algorithmic complexity of allocating.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum AllocationStrategy<I> {
+    /// Allocate as optimally as possible, by taking some extra time into making sure that the
+    /// smallest range with the smallest alignment possible is used. This is currently O(1) in best
+    /// case, but O(n) in worst case.
+    Optimal,
+
+    /// Allocate as quickly as possible. This is currently implemented as a B-tree lookup in the
+    /// free space map, so it'll prioritize smaller ranges, and smaller alignments afterwards. This
+    /// is O(log n) in best case, average case, and worst case.
+    Greedy,
+
+    /// Allocate at a fixed offset. Since this won't cause the allocator to find a suitable range,
+    /// but only check whether the range requested exists, this is also O(log n) in best case,
+    /// average case, and worst case.
+    Fixed(I),
+}
+
+impl<I> Default for AllocationStrategy<I> {
+    fn default() -> Self {
+        Self::Optimal
+    }
+}
+
 impl<I, H, E> BufferPool<I, H, E>
 where
     I: Integer,
@@ -877,6 +951,11 @@ where
             options: BufferPoolOptions::default(),
         }
     }
+    /// Set the allocation options used by the buffer pool, e.g. the size and alignment bounds.
+    pub fn with_options(mut self, options: BufferPoolOptions<I>) -> Self {
+        self.options = options;
+        self
+    }
     /// Convenience wrapper over `Arc::new(self)`.
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
@@ -889,12 +968,18 @@ where
         &self,
         len: I,
         alignment: I,
-        at: Option<I>,
+        strategy: AllocationStrategy<I>,
     ) -> Option<(ops::Range<I>, I, ops::Range<I>, *mut u8, E)> {
-        let log2_alignment = alignment.clamp(
-            self.options.log2_minimum_alignment,
-            self.options.log2_maximum_alignment,
-        );
+        assert_ne!(len, I::zero());
+
+        if len > self.options.maximum_size {
+            return None;
+        }
+
+        if alignment > (I::from(1u8) << self.options.log2_maximum_alignment) {
+            return None;
+        }
+        let alignment = std::cmp::max(alignment, I::from(1u8) << self.options.log2_minimum_alignment);
 
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
@@ -915,24 +1000,47 @@ where
                 .checked_mul(alignment)
         }
 
-        let (occ_k, occ_v, free_e) = if let Some(at) = at {
+        let (occ_k, occ_v, free_e) = if let AllocationStrategy::Fixed(at) = strategy {
             let (occ_k, occ_v) = occ_intent_guard
                 .range(..=OccOffset::from_offset_used(at, false))
                 .next_back()?;
+
+            if occ_v.size() < len {
+                return None;
+            }
+
             let free_e = free_intent_guard
                 .get(&FreeEntry::from_size_offset(occ_v.0, occ_k.offset()))
                 .expect("expected occ map to contain a corresponding entry for the free entry");
 
             (occ_k, occ_v, *free_e)
         } else {
-            let free_e = free_intent_guard.iter().find(|e| {
-                e.size() >= len
-                    && align(e.offset(), alignment)
-                        .map_or(false, |aligned| e.size() - (aligned - e.offset()) >= len)
-            })?;
+            fn find_o_n<I: Integer>(free_map: &BTreeSet<FreeEntry<I>>, len: I, alignment: I) -> Option<&FreeEntry<I>> {
+                free_map.iter().find(|e| {
+                    e.size() >= len
+                        && align(e.offset(), alignment)
+                            .map_or(false, |aligned| e.size() - (aligned - e.offset()) >= len)
+                })
+            }
+            fn find_o_logn<I: Integer>(free_map: &BTreeSet<FreeEntry<I>>, len: I, alignment: I) -> Option<&FreeEntry<I>> {
+                let item = free_map.range(FreeEntry::from_size_offset(len, alignment)..).next()?;
+                if item.size() >= len && align(item.offset(), alignment).map_or(false, |aligned| item.size() - (aligned - item.offset()) >= len) {
+                    Some(item)
+                } else {
+                    find_o_n(free_map, len, alignment)
+                }
+            }
+            let free_e = if let AllocationStrategy::Greedy = strategy {
+                find_o_logn(&*free_intent_guard, len, alignment)?
+            } else if let AllocationStrategy::Optimal = strategy {
+                find_o_n(&*free_intent_guard, len, alignment)?
+            } else {
+                unreachable!()
+            };
             let (occ_k, occ_v) = occ_intent_guard
                 .get_key_value(&OccOffset::from_offset_used(free_e.offset(), false))
                 .expect("expected free map to contain a corresponding entry for the occ entry");
+
             (occ_k, occ_v, *free_e)
         };
 
@@ -1110,10 +1218,10 @@ where
         &self,
         len: I,
         alignment: I,
-        offset: Option<I>,
+        strategy: AllocationStrategy<I>,
     ) -> Option<BufferSlice<'_, I, H, E, G>> {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            self.acquire_slice(len, alignment, offset)?;
+            self.acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
@@ -1133,10 +1241,10 @@ where
         self: &Arc<Self>,
         len: I,
         alignment: I,
-        offset: Option<I>,
+        strategy: AllocationStrategy<I>,
     ) -> Option<BufferSlice<'static, I, H, E, G>> {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            self.acquire_slice(len, alignment, offset)?;
+            self.acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
@@ -1155,10 +1263,10 @@ where
         self: &Arc<Self>,
         len: I,
         alignment: I,
-        offset: Option<I>,
+        strategy: AllocationStrategy<I>,
     ) -> Option<BufferSlice<'static, I, H, E, G>> {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            self.acquire_slice(len, alignment, offset)?;
+            self.acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
@@ -1508,8 +1616,8 @@ mod tests {
 
     use std::{mem, thread};
 
-    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool<u32, NoHandle, ()>, u32) {
-        let mut pool = BufferPool::new(None);
+    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>, options: BufferPoolOptions<u32>) -> (BufferPool<u32, NoHandle, ()>, u32) {
+        let pool = BufferPool::new(None);
         let mut total_size = 0;
 
         for map in maps {
@@ -1518,6 +1626,8 @@ mod tests {
             let ptr = slice.as_mut_ptr();
             let len = slice.len();
 
+            total_size += u32::try_from(len).unwrap();
+
             let _raw_slice = Box::into_raw(slice);
             unsafe {
                 pool.begin_expand(u32::try_from(len).unwrap())
@@ -1525,20 +1635,28 @@ mod tests {
                     .initialize(std::ptr::NonNull::new(ptr).unwrap(), ())
             }
         }
-        (pool, total_size)
+        (pool.with_options(options), total_size)
     }
-    fn setup_default_pool() -> (BufferPool<u32, NoHandle, ()>, u32) {
-        setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]])
+    fn setup_default_pool(options: BufferPoolOptions<u32>) -> (BufferPool<u32, NoHandle, ()>, u32) {
+        setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]], options)
     }
 
     #[test]
-    fn occ_map_acquisition_single_mmap() {
-        let (pool, _) = setup_default_pool();
+    fn occ_map_acquisition_single_mmap_optimal() {
+        occ_map_acquisition_single_mmap(AllocationStrategy::Optimal)
+    }
+    #[test]
+    fn occ_map_acquisition_single_mmap_greedy() {
+        occ_map_acquisition_single_mmap(AllocationStrategy::Greedy)
+    }
+
+    fn occ_map_acquisition_single_mmap(strategy: AllocationStrategy<u32>) {
+        let (pool, _) = setup_default_pool(Default::default());
 
         let mut slices = Vec::new();
 
         loop {
-            let mut slice = match pool.acquire_borrowed_slice::<NoGuard>(4096, 1, None) {
+            let mut slice = match pool.acquire_borrowed_slice::<NoGuard>(4096, 1, strategy) {
                 Some(s) => s,
                 None => break,
             };
@@ -1553,11 +1671,19 @@ mod tests {
         mem::forget(pool);
     }
     #[test]
-    fn occ_multithreaded() {
+    fn occ_multithreaded_optimal() {
+        occ_multithreaded(AllocationStrategy::Optimal)
+    }
+    #[test]
+    fn occ_multithreaded_greedy() {
+        occ_multithreaded(AllocationStrategy::Optimal)
+    }
+
+    fn occ_multithreaded(strategy: AllocationStrategy<u32>) {
         // This test is not about aliasing, but rather to get all the assertions and expects, to
         // work when there are multiple threads constantly trying to acquire and release slices.
 
-        let (pool, _) = setup_default_pool();
+        let (pool, _) = setup_default_pool(Default::default());
         let pool = pool.shared();
 
         const THREAD_COUNT: usize = 8;
@@ -1579,7 +1705,7 @@ mod tests {
                     'retry: loop {
                         let len = thread_rng.gen_range(64, 4096);
                         let align = 1 << thread_rng.gen_range(0, 3);
-                        match pool.acquire_borrowed_slice::<NoGuard>(len, align, None) {
+                        match pool.acquire_borrowed_slice::<NoGuard>(len, align, strategy) {
                             Some(_) => break 'retry,
                             None => continue 'retry,
                         }
@@ -1591,15 +1717,24 @@ mod tests {
             thread.join().unwrap();
         }
     }
+
     #[test]
-    fn no_aliasing() {
-        let (pool, _) = setup_default_pool();
+    fn no_aliasing_optimal() {
+        no_aliasing(AllocationStrategy::Optimal)
+    }
+    #[test]
+    fn no_aliasing_greedy() {
+        no_aliasing(AllocationStrategy::Greedy)
+    }
+
+    fn no_aliasing(strategy: AllocationStrategy<u32>) {
+        let (pool, _) = setup_default_pool(Default::default());
         const SIZE: u32 = 512;
 
         let mut slices = Vec::new();
 
         loop {
-            let slice = match pool.acquire_borrowed_slice::<NoGuard>(SIZE, 1, None) {
+            let slice = match pool.acquire_borrowed_slice::<NoGuard>(SIZE, 1, strategy) {
                 Some(s) => s,
                 None => break,
             };
@@ -1611,16 +1746,29 @@ mod tests {
         }
     }
     #[test]
-    fn alignment() {
-        let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
+    fn alignment_greedy() {
+        alignment(AllocationStrategy::Greedy)
+    }
+
+    #[test]
+    fn alignment_optimal() {
+        alignment(AllocationStrategy::Optimal)
+    }
+
+    fn alignment(strategy: AllocationStrategy<u32>) {
+        let options = BufferPoolOptions::default().with_minimum_alignment(1);
+        let (pool, _) = setup_pool(vec![vec![0u8; 4096]], options);
+
+        dbg!(options);
 
         fn get_and_check_slice(
             pool: &BufferPool<u32, NoHandle, ()>,
             size: u32,
             align: u32,
             fill_byte: u8,
+            strategy: AllocationStrategy<u32>,
         ) -> BufferSlice<u32, NoHandle, ()> {
-            let mut slice = pool.acquire_borrowed_slice(size, align, None).unwrap();
+            let mut slice = pool.acquire_borrowed_slice(size, align, strategy).unwrap();
             assert!(slice.iter().all(|&byte| byte == 0));
             slice.fill(fill_byte);
             assert!(slice.iter().all(|&byte| byte == fill_byte));
@@ -1630,9 +1778,9 @@ mod tests {
         }
 
         {
-            let _small_begin_slice = get_and_check_slice(&pool, 64, 1, 0x01);
-            let _aligned_slice = get_and_check_slice(&pool, 128, 128, 0x02);
-            let _half_page = get_and_check_slice(&pool, 2048, 2048, 0xFE);
+            let _small_begin_slice = get_and_check_slice(&pool, 64, 1, 0x01, strategy);
+            let _aligned_slice = get_and_check_slice(&pool, 128, 128, 0x02, strategy);
+            let _half_page = get_and_check_slice(&pool, 2048, 2048, 0xFE, strategy);
         }
     }
     #[test]
