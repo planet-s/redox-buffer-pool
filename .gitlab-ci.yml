@@ -10,7 +10,7 @@ rust-nightly:
   script:
     - cargo build --verbose
     - cargo test --verbose
-    - cargo fmt --all --verbose -- --check
+    - which rustfmt && cargo fmt --all --verbose -- --check
     - cargo clippy --workspace --verbose -- -D warnings
 
 # TODO: Test on Redox with a VM
