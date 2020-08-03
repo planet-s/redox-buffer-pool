@@ -17,7 +17,6 @@ default = []
 redox = ["redox_syscall"]
 
 [dependencies]
-cranelift-bforest = "0.65"
 log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"] }
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring", optional = true }

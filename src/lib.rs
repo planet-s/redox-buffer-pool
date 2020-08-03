@@ -11,184 +11,333 @@
 //! slices O(log n) (TODO: Make this O(log n) rather than O(n)).
 
 #![deny(missing_docs)]
-#![feature(option_expect_none)]
+#![feature(clamp, option_expect_none, option_unwrap_none, map_first_last)]
 #![cfg_attr(test, feature(slice_fill, vec_into_raw_parts))]
 
 use std::borrow::{Borrow, BorrowMut};
-use std::convert::TryInto;
+use std::collections::{BTreeMap, BTreeSet};
+use std::convert::{TryFrom, TryInto};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{cmp, fmt, mem, ops, slice};
 
-use cranelift_bforest::{Comparator, Map, MapForest};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
-/// A comparator that only compares the offsets of two ranges.
-struct RangeOffsetComparator;
-
-/// A comparator that compares the offsets of two ranges, and then the occupiedness of them
-/// (occupied is greater than not occupied).
-struct RangeOffsetThenUsedComparator;
-
-/// A comparator that first compares the occupiedness of the keys (occupied is greater than not
-/// occupied), and then their offsets.
-struct RangeUsedThenOffsetComparator;
-
-#[derive(Clone, Copy, Ord, Eq, Hash, PartialOrd, PartialEq)]
-struct OccOffsetHalf {
-    offset: u32,
-}
-impl fmt::Debug for OccOffsetHalf {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OccOffsetHalf")
-            .field("offset", &self.offset())
-            .field("is_used", &self.is_used())
-            .finish()
-    }
-}
-
-const RANGE_OFF_OFFSET_MASK: u32 = 0x7FFF_FFFF;
-const RANGE_OFF_OFFSET_SHIFT: u8 = 0;
-const RANGE_OFF_OCCUPD_SHIFT: u8 = 31;
-const RANGE_OFF_OCCUPD_BIT: u32 = 1 << RANGE_OFF_OCCUPD_SHIFT;
-
-impl OccOffsetHalf {
-    const fn offset(&self) -> u32 {
-        (self.offset & RANGE_OFF_OFFSET_MASK) >> RANGE_OFF_OFFSET_SHIFT
-    }
-    const fn is_used(&self) -> bool {
-        self.offset & RANGE_OFF_OCCUPD_BIT != 0
-    }
-    const fn is_free(&self) -> bool {
-        !self.is_used()
-    }
-    fn unused(offset: u32) -> Self {
-        assert_eq!(offset & RANGE_OFF_OFFSET_MASK, offset);
-        Self { offset }
-    }
-    fn used(offset: u32) -> Self {
-        assert_eq!(offset & RANGE_OFF_OFFSET_MASK, offset);
-        Self {
-            offset: offset | RANGE_OFF_OCCUPD_BIT,
+mod private {
+    pub trait Sealed {}
+    pub trait IntegerRequirements: Sized + From<u8> {
+        fn zero() -> Self {
+            Self::from(0u8)
         }
+        const MAX: Self;
+        fn trailing_zeros(self) -> u32;
+
+        fn try_into_usize(self) -> Option<usize>;
+        fn checked_add(self, rhs: Self) -> Option<Self>;
+        fn checked_sub(self, rhs: Self) -> Option<Self>;
+        fn checked_div(self, rhs: Self) -> Option<Self>;
+        fn checked_mul(self, rhs: Self) -> Option<Self>;
+        fn is_power_of_two(self) -> bool;
     }
 }
-impl Comparator<OccOffsetHalf> for RangeOffsetComparator {
-    fn cmp(&self, a: OccOffsetHalf, b: OccOffsetHalf) -> cmp::Ordering {
-        Ord::cmp(&a.offset(), &b.offset())
+
+/// A type that can be used as offsets and lengths within a buffer pool. The default integer is
+/// u32.
+pub unsafe trait Integer:
+
+    // TODO: I don't like big dependencies, but maybe we should use num-traits for this?
+
+    private::Sealed
+    + private::IntegerRequirements
+
+    + Sized
+    + Copy
+    + Clone
+    + fmt::Debug
+    + fmt::Display
+
+    + Eq
+    + PartialEq<Self>
+    + PartialOrd<Self>
+    + Ord
+
+    + From<u8>
+
+    + ops::Add<Self, Output = Self>
+    + ops::AddAssign
+    + ops::Sub<Self, Output = Self>
+
+    + ops::Shl<u8, Output = Self>
+    + ops::Shl<u32, Output = Self>
+    + ops::Shr<u8, Output = Self>
+    + ops::Shr<u32, Output = Self>
+    + ops::Not<Output = Self>
+    + ops::BitAnd<Output = Self>
+    + ops::BitAndAssign
+    + ops::BitOr<Output = Self>
+    + ops::BitOrAssign
+    + ops::BitXor<Self, Output = Self>
+{
+}
+fn free_space_align_width<I: Integer>() -> u32 {
+    let bit_count = mem::size_of::<I>() * 8;
+    // Assuming that the size is a power of two, this will give the number of bits can are used to
+    // describe the number of bits of the size itself.
+    bit_count.trailing_zeros()
+}
+fn free_space_align_shift<I: Integer>() -> u32 {
+    (mem::size_of::<I>() * 8) as u32 - free_space_align_width::<I>()
+}
+fn free_space_align_mask<I: Integer>() -> I {
+    (!I::zero()) ^ ((I::from(1u8) << free_space_align_shift::<I>()) - I::from(1u8))
+}
+fn free_space_size_shift<I: Integer>() -> u32 {
+    0
+}
+fn free_space_size_mask<I: Integer>() -> I {
+    !free_space_align_mask::<I>()
+}
+
+fn occ_map_ready_shift<I: Integer>() -> u32 {
+    let bit_count = (mem::size_of::<I>() * 8) as u32;
+    bit_count - 1
+}
+fn occ_map_used_bit<I: Integer>() -> I {
+    I::from(1u8) << occ_map_ready_shift::<I>()
+}
+fn occ_map_off_mask<I: Integer>() -> I {
+    !occ_map_used_bit::<I>()
+}
+
+macro_rules! impl_integer_for_primitive(
+    ($primitive:ident) => {
+        impl private::IntegerRequirements for $primitive {
+            fn trailing_zeros(self) -> u32 {
+                Self::trailing_zeros(self)
+            }
+            const MAX: Self = Self::MAX;
+
+            fn try_into_usize(self) -> Option<usize> {
+                usize::try_from(self).ok()
+            }
+            fn checked_add(self, rhs: Self) -> Option<Self> {
+                Self::checked_add(self, rhs)
+            }
+            fn checked_sub(self, rhs: Self) -> Option<Self> {
+                Self::checked_add(self, rhs)
+            }
+            fn checked_div(self, rhs: Self) -> Option<Self> {
+                Self::checked_div(self, rhs)
+            }
+            fn checked_mul(self, rhs: Self) -> Option<Self> {
+                Self::checked_mul(self, rhs)
+            }
+            fn is_power_of_two(self) -> bool {
+                Self::is_power_of_two(self)
+            }
+        }
+        unsafe impl Integer for $primitive {}
+    }
+);
+
+impl_integer_for_primitive!(u16);
+impl_integer_for_primitive!(u32);
+impl_integer_for_primitive!(u64);
+impl_integer_for_primitive!(u128);
+impl_integer_for_primitive!(usize);
+
+impl private::Sealed for u16 {}
+impl private::Sealed for u32 {}
+impl private::Sealed for u64 {}
+impl private::Sealed for u128 {}
+impl private::Sealed for usize {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
+struct Offset<I>(I);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
+struct Size<I>(I);
+
+impl<I: Integer> Size<I> {
+    fn size(&self) -> I {
+        self.0
+    }
+    fn from_size(size: I) -> Self {
+        Self(size)
+    }
+    fn set_size(&mut self, size: I) {
+        self.0 = size;
     }
 }
-impl Comparator<OccOffsetHalf> for RangeOffsetThenUsedComparator {
-    fn cmp(&self, a: OccOffsetHalf, b: OccOffsetHalf) -> cmp::Ordering {
-        RangeOffsetComparator
-            .cmp(a, b)
-            .then(Ord::cmp(&a.is_used(), &b.is_used()))
+
+// A key of the free space B-tree, storing the size and the alignment (which is computed based on
+// the offset, which is the value of that tree).
+//
+// Obviously this key is comparable; it first compares the size, and then the alignment.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FreeEntry<I> {
+    size: I,
+    offset: I,
+}
+
+impl<I: Integer> FreeEntry<I> {
+    fn size(&self) -> I {
+        self.size
+    }
+    fn offset(&self) -> I {
+        self.offset
+    }
+    fn log2_of_alignment(&self) -> I {
+        I::from(self.offset.trailing_zeros() as u8)
+    }
+    fn set_size(&mut self, size: I) {
+        self.size = size;
+    }
+    fn set_offset(&mut self, offset: I) {
+        self.offset = offset;
+    }
+    fn from_size_offset(size: I, offset: I) -> Self {
+        Self { size, offset }
     }
 }
-impl Comparator<OccOffsetHalf> for RangeUsedThenOffsetComparator {
-    fn cmp(&self, a: OccOffsetHalf, b: OccOffsetHalf) -> cmp::Ordering {
-        Ord::cmp(&a.is_used(), &b.is_used()).then(RangeOffsetComparator.cmp(a, b))
+impl<I: Integer> Ord for FreeEntry<I> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        Ord::cmp(&self.size(), &other.size())
+            .then(Ord::cmp(
+                &self.log2_of_alignment(),
+                &other.log2_of_alignment(),
+            ))
+            .then(Ord::cmp(&self.offset, &other.offset))
+    }
+}
+impl<I: Integer> PartialOrd<Self> for FreeEntry<I> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(Ord::cmp(self, other))
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct OccInfoHalf {
-    size: u32,
-}
-impl OccInfoHalf {
-    const fn with_size(size: u32) -> Self {
-        Self { size }
-    }
-}
-struct OccMap {
-    map: Map<OccOffsetHalf, OccInfoHalf>,
-    forest: MapForest<OccOffsetHalf, OccInfoHalf>,
-}
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct MmapOffsetHalf {
-    offset: u32,
-}
-const MMAP_OFF_OFFSET_MASK: u32 = 0x7FFF_FFFF;
-const MMAP_OFF_OFFSET_SHIFT: u8 = 0;
-const MMAP_OFF_PENDING_SHIFT: u8 = 31;
-const MMAP_OFF_PENDING_BIT: u32 = 1 << MMAP_OFF_PENDING_SHIFT;
+struct OccOffset<I>(I);
 
-impl MmapOffsetHalf {
-    fn ready_or_pending(offset: u32) -> Self {
-        assert_eq!(offset & MMAP_OFF_OFFSET_MASK, offset);
-
-        Self { offset }
+impl<I: Integer> OccOffset<I> {
+    fn offset(&self) -> I {
+        self.0 & occ_map_off_mask::<I>()
     }
-    fn ready(offset: u32) -> Self {
-        Self::ready_or_pending(offset)
+    fn is_used(&self) -> bool {
+        self.0 & occ_map_used_bit::<I>() == occ_map_used_bit::<I>()
     }
-    fn pending(offset: u32) -> Self {
-        assert_eq!(offset & MMAP_OFF_OFFSET_MASK, offset);
-        Self {
-            offset: offset | MMAP_OFF_PENDING_BIT,
+    fn set_offset(&mut self, offset: I) {
+        assert_eq!(offset & occ_map_off_mask::<I>(), offset);
+        self.0 &= !occ_map_off_mask::<I>();
+        self.0 |= offset;
+    }
+    fn set_used(&mut self, used: bool) {
+        self.0 &= !occ_map_used_bit::<I>();
+        if used {
+            self.0 |= occ_map_used_bit::<I>();
         }
     }
-    const fn offset(&self) -> u32 {
-        (self.offset & MMAP_OFF_OFFSET_MASK) >> MMAP_OFF_OFFSET_SHIFT
-    }
-    const fn is_pending(&self) -> bool {
-        self.offset & MMAP_OFF_PENDING_BIT != 0
-    }
-    const fn is_ready(&self) -> bool {
-        !self.is_pending()
+    fn from_offset_used(offset: I, used: bool) -> Self {
+        let mut this = Self(I::zero());
+        this.set_offset(offset);
+        this.set_used(used);
+        this
     }
 }
-impl<E: Copy> MmapInfoHalf<E> {
+
+impl<I: Integer> Ord for OccOffset<I> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        Ord::cmp(&self.is_used(), &other.is_used()).then(Ord::cmp(&self.offset(), &other.offset()))
+    }
+}
+impl<I: Integer> PartialOrd for OccOffset<I> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+
+impl<I: Integer, E: Copy> MmapInfo<I, E> {
     fn null() -> Self {
         Self {
-            // reasonable since size == 0 implies _no pointer access at all_
-            addr: NonNull::dangling(),
+            addr: Addr::Uninitialized,
             extra: MaybeUninit::uninit(),
-            size: 0,
+            size: Size::from_size(I::zero()),
         }
-    }
-}
-/// Compares whether the mmap is pending (pending is greater than non-pending), and then the actual
-/// offset.
-struct MmapComparatorOffset;
-
-impl Comparator<MmapOffsetHalf> for MmapComparatorOffset {
-    fn cmp(&self, a: MmapOffsetHalf, b: MmapOffsetHalf) -> cmp::Ordering {
-        Ord::cmp(&a.offset(), &b.offset())
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MmapInfoHalf<E: Copy> {
-    size: u32,
+struct MmapInfo<I, E: Copy> {
+    size: Size<I>,
     extra: MaybeUninit<E>,
-    addr: NonNull<u8>,
+    addr: Addr,
+}
+#[derive(Clone, Copy, Debug)]
+enum Addr {
+    Initialized(NonNull<u8>),
+    Uninitialized,
 }
 
-struct MmapMap<E: Copy> {
-    map: Map<MmapOffsetHalf, MmapInfoHalf<E>>,
-    forest: MapForest<MmapOffsetHalf, MmapInfoHalf<E>>,
+impl Addr {
+    fn as_ptr(&self) -> *mut u8 {
+        match self {
+            Self::Initialized(ptr) => ptr.as_ptr(),
+            Self::Uninitialized => std::ptr::null_mut(),
+        }
+    }
 }
+
+impl<I, E: Copy> MmapInfo<I, E> {
+    fn is_init(&self) -> bool {
+        matches!(self.addr, Addr::Initialized(_))
+    }
+}
+
+struct BufferPoolOptions<I> {
+    log2_minimum_alignment: I,
+    log2_maximum_alignment: I,
+
+    // The minimum size doesn't make sense, as the minimum alignment is the one that forces sizes
+    // not to get uneven.
+    maximum_size: I,
+}
+impl<I: Integer> Default for BufferPoolOptions<I> {
+    fn default() -> Self {
+        Self {
+            log2_minimum_alignment: I::zero(),
+            log2_maximum_alignment: I::MAX,
+            maximum_size: I::from(1u8) << free_space_size_shift::<I>(),
+        }
+    }
+}
+
 /// A buffer pool, featuring a general-purpose 32-bit allocator, and slice guards.
 // TODO: Expand doc
-pub struct BufferPool<H: Handle, E: Copy> {
+pub struct BufferPool<I: Integer, H: Handle, E: Copy> {
     handle: Option<H>,
 
+    options: BufferPoolOptions<I>,
+
     // TODO: Concurrent B-tree
-    // TODO: Don't use forests!
     guarded_occ_count: AtomicUsize,
 
-    // The map all occupations
-    occ_map: RwLock<OccMap>,
-    mmap_map: RwLock<MmapMap<E>>,
+    // Occupied entries, mapped offset + used => size.
+    occ_map: RwLock<BTreeMap<OccOffset<I>, Size<I>>>,
+    // Free entries containing size+align+offset, in that order.
+    free_map: RwLock<BTreeSet<FreeEntry<I>>>,
+    // "mmap" map, mapped offset => info. These aren't required to come from the mmap syscall; they
+    // are general-purpose larger allocations that this buffer pool builds on. Hence, these can
+    // also be io_uring "pool" shared memory or physalloc+physmap DMA allocations.
+    mmap_map: RwLock<BTreeMap<Offset<I>, MmapInfo<I, E>>>,
 }
-unsafe impl<H: Send + Handle, E: Copy> Send for BufferPool<H, E> {}
-unsafe impl<H: Sync + Handle, E: Copy> Sync for BufferPool<H, E> {}
+unsafe impl<I: Integer + Send + Sync, H: Send + Handle, E: Copy> Send for BufferPool<I, H, E> {}
+unsafe impl<I: Integer + Send + Sync, H: Sync + Handle, E: Copy> Sync for BufferPool<I, H, E> {}
 
-impl<H, E> fmt::Debug for BufferPool<H, E>
+impl<I, H, E> fmt::Debug for BufferPool<I, H, E>
 where
+    I: Integer,
     H: fmt::Debug + Handle,
     E: Copy,
 {
@@ -208,29 +357,41 @@ impl Guard for NoGuard {
     }
 }
 
+/// A handle type that cannot be initialized, causing the handle to take up no space in the buffer
+/// pool struct.
+pub enum NoHandle {}
+
+impl Handle for NoHandle {
+    fn close(self) -> Result<(), CloseError<()>> {
+        unreachable!("NoHandle cannot be initialized")
+    }
+}
+
 // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
 // exclusive, while a higher refcount would mean shared.
 #[derive(Debug)]
 /// A slice from the buffer pool, that can be read from or written to as a regular smart pointer.
-pub struct BufferSlice<'a, H: Handle, E: Copy, G: Guard = NoGuard> {
-    alloc_start: u32,
-    alloc_size: u32,
-    mmap_start: u32,
-    mmap_size: u32,
+pub struct BufferSlice<'a, I: Integer, H: Handle, E: Copy, G: Guard = NoGuard> {
+    alloc_start: I,
+    alloc_capacity: I,
+    alloc_len: I,
+
+    mmap_start: I,
+    mmap_size: I,
     pointer: *mut u8,
     extra: E,
 
-    pool: PoolRefKind<'a, H, E>,
+    pool: PoolRefKind<'a, I, H, E>,
     guard: Option<G>,
 }
 
 #[derive(Debug)]
-enum PoolRefKind<'a, H: Handle, E: Copy> {
-    Ref(&'a BufferPool<H, E>),
-    Strong(Arc<BufferPool<H, E>>),
-    Weak(Weak<BufferPool<H, E>>),
+enum PoolRefKind<'a, I: Integer, H: Handle, E: Copy> {
+    Ref(&'a BufferPool<I, H, E>),
+    Strong(Arc<BufferPool<I, H, E>>),
+    Weak(Weak<BufferPool<I, H, E>>),
 }
-impl<'a, H: Handle, E: Copy> Clone for PoolRefKind<'a, H, E> {
+impl<'a, I: Integer, H: Handle, E: Copy> Clone for PoolRefKind<'a, I, H, E> {
     fn clone(&self) -> Self {
         match *self {
             Self::Ref(r) => Self::Ref(r),
@@ -240,23 +401,26 @@ impl<'a, H: Handle, E: Copy> Clone for PoolRefKind<'a, H, E> {
     }
 }
 
-unsafe impl<'a, H, E, G> Send for BufferSlice<'a, H, E, G>
+unsafe impl<'a, I, H, E, G> Send for BufferSlice<'a, I, H, E, G>
 where
+    I: Integer,
     H: Send + Sync + Handle,
     E: Copy + Send,
     G: Send + Guard,
 {
 }
-unsafe impl<'a, H, E, G> Sync for BufferSlice<'a, H, E, G>
+unsafe impl<'a, I, H, E, G> Sync for BufferSlice<'a, I, H, E, G>
 where
+    I: Integer,
     H: Send + Sync + Handle,
     E: Copy + Sync,
     G: Sync + Guard,
 {
 }
 
-impl<'a, H, E, G> BufferSlice<'a, H, E, G>
+impl<'a, I, H, E, G> BufferSlice<'a, I, H, E, G>
 where
+    I: Integer,
     H: Handle,
     E: Copy,
     G: Guard,
@@ -282,10 +446,13 @@ where
     /// This method will panic if this is a weak slice, and the buffer pool has been destroyed..
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.pool_is_alive());
+        debug_assert!(self.alloc_capacity >= self.alloc_len);
         unsafe {
             slice::from_raw_parts(
                 self.pointer as *const u8,
-                self.alloc_size.try_into().unwrap(),
+                self.alloc_len
+                    .try_into_usize()
+                    .expect("the buffer pool integer type is too large to fit within the system pointer width"),
             )
         }
     }
@@ -305,7 +472,10 @@ where
     /// Like [`as_slice`], this method will panic if the buffer pool has been destroyed.
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
         assert!(self.pool_is_alive());
-        unsafe { slice::from_raw_parts_mut(self.pointer, self.alloc_size.try_into().unwrap()) }
+        debug_assert!(self.alloc_capacity >= self.alloc_len);
+        unsafe {
+            slice::from_raw_parts_mut(self.pointer, self.alloc_len.try_into_usize().expect("the buffer pool integer type is too large to fit within the system pointer width"))
+        }
     }
     /// Tries to construct a mutable slice from this buffer, returning None if the pool has been
     /// destroyed.
@@ -381,12 +551,13 @@ where
     pub fn with_guard<OtherGuard: Guard>(
         self,
         other: OtherGuard,
-    ) -> Result<BufferSlice<'a, H, E, OtherGuard>, WithGuardError<Self>> {
+    ) -> Result<BufferSlice<'a, I, H, E, OtherGuard>, WithGuardError<Self>> {
         if self.guard.is_some() {
             return Err(WithGuardError { this: self });
         }
         let alloc_start = self.alloc_start;
-        let alloc_size = self.alloc_size;
+        let alloc_capacity = self.alloc_capacity;
+        let alloc_len = self.alloc_len;
         let mmap_start = self.mmap_start;
         let mmap_size = self.mmap_size;
         let pointer = self.pointer;
@@ -397,7 +568,8 @@ where
 
         let mut slice = BufferSlice {
             alloc_start,
-            alloc_size,
+            alloc_capacity,
+            alloc_len,
             mmap_start,
             mmap_size,
             pointer,
@@ -455,24 +627,29 @@ where
     }
 
     /// Get the offset of the buffer pool where this was allocated.
-    pub fn offset(&self) -> u32 {
+    pub fn offset(&self) -> I {
         self.alloc_start
     }
     /// Get the length of the allocation slice.
-    pub fn len(&self) -> u32 {
-        self.alloc_size
+    pub fn len(&self) -> I {
+        self.alloc_len
+    }
+    /// Get the capacity of the allocation slice. This is almost always the same as the length, but
+    /// may be larger in case the allocator chose a larger size to align the range afterwards.
+    pub fn capacity(&self) -> I {
+        self.alloc_capacity
     }
     /// Check whether the slice is empty or not.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len() == I::zero()
     }
-    /// Get the offset of the underlying possibly non-contiguously-organized mmap, that was added
+    /// Get the offset of the underlying possibly non-continuously-organized mmap, that was added
     /// as part of [`BufferPool::expand`].
-    pub fn mmap_offset(&self) -> u32 {
+    pub fn mmap_offset(&self) -> I {
         self.mmap_start
     }
     /// Get the size of the mmap region this slice was allocated in.
-    pub fn mmap_size(&self) -> u32 {
+    pub fn mmap_size(&self) -> I {
         self.mmap_size
     }
     /// Get the extra field from the mmap region this slice belongs to, copied.
@@ -480,8 +657,9 @@ where
         self.extra
     }
 }
-impl<'a, H, E, G> Drop for BufferSlice<'a, H, E, G>
+impl<'a, I, H, E, G> Drop for BufferSlice<'a, I, H, E, G>
 where
+    I: Integer,
     G: Guard,
     E: Copy,
     H: Handle,
@@ -495,34 +673,34 @@ where
         }
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> ops::Deref for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> ops::Deref for BufferSlice<'a, I, H, E, G> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> ops::DerefMut for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> ops::DerefMut for BufferSlice<'a, I, H, E, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> Borrow<[u8]> for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> Borrow<[u8]> for BufferSlice<'a, I, H, E, G> {
     fn borrow(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> BorrowMut<[u8]> for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> BorrowMut<[u8]> for BufferSlice<'a, I, H, E, G> {
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> AsRef<[u8]> for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> AsRef<[u8]> for BufferSlice<'a, I, H, E, G> {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, H, E, G> {
+impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, I, H, E, G> {
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
@@ -530,27 +708,28 @@ impl<'a, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, H, E, G> 
 /// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
 /// method, the range has already been reserved, so it's up to this handle to initialize it.
 // TODO: Reclaim pending slice upon Drop or a fallible cancel method.
-pub struct ExpandHandle<'a, H: Handle, E: Copy> {
-    offset: u32,
-    len: u32,
-    pool: &'a BufferPool<H, E>,
+pub struct ExpandHandle<'a, I: Integer, H: Handle, E: Copy> {
+    offset: I,
+    len: I,
+    pool: &'a BufferPool<I, H, E>,
 }
-impl<'a, H, E> ExpandHandle<'a, H, E>
+impl<'a, I, H, E> ExpandHandle<'a, I, H, E>
 where
+    I: Integer,
     H: Handle,
     E: Copy,
 {
     /// Get the length of the range that has been reserved for this specific allocation.
-    pub fn len(&self) -> u32 {
+    pub fn len(&self) -> I {
         self.len
     }
     /// Check whether the pending expansion consists of no bytes. Note that zero-sized allocations
     /// will panic anyways, so this will always return false, but is still there for completeness.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == I::zero()
     }
     /// Get the offset within the buffer pool, where this allocation is to take place.
-    pub fn offset(&self) -> u32 {
+    pub fn offset(&self) -> I {
         self.offset
     }
     /// Provide the handle with an actually allocated pointer, initializing the memory range within
@@ -559,64 +738,43 @@ where
     /// # Safety
     ///
     /// For this to be safe, the pointer must be a valid allocation (anywhere) of the size
-    /// originally inputted. THE POINTER MUST NOT BE NULL, or the rust compiler will execute the
-    /// wrong code! TODO: alignment
-    pub unsafe fn initialize(self, pointer: *mut u8, extra: E) {
-        let mut write_guard = self.pool.mmap_map.write();
-        let mmap_map = &mut *write_guard;
+    /// originally inputted. The allocation must have the static lifetime, so pointers to the stack
+    /// obviously don't apply here.
+    pub unsafe fn initialize(self, pointer: NonNull<u8>, extra: E) {
+        let mut mmap_write_guard = self.pool.mmap_map.write();
 
-        let new_offset_half = MmapOffsetHalf::ready(self.offset());
-        let old_offset_half = MmapOffsetHalf::pending(self.offset());
+        let key = Offset(self.offset());
 
-        let new_info_half = MmapInfoHalf {
-            addr: NonNull::new_unchecked(pointer as *const u8 as *mut u8),
-            size: self.len(),
+        let new_initialized_value = MmapInfo {
+            addr: Addr::Initialized(pointer),
+            size: Size::from_size(self.len()),
             extra: MaybeUninit::new(extra),
         };
 
-        // Remove the previous entry marked "pending", and insert a new entry marked "ready".
-        mmap_map
-            .map
-            .remove(old_offset_half, &mut mmap_map.forest, &())
-            .expect("pending mmap range was not ");
-
-        if mmap_map
-            .map
-            .insert(new_offset_half, new_info_half, &mut mmap_map.forest, &())
-            .is_some()
-        {
-            panic!(
-                "somehow the mmap range that was supposed to go from \"pending\" to \"ready\", was already inserted as \"ready\""
-            );
-        }
+        mmap_write_guard
+            .insert(key, new_initialized_value)
+            .expect("expected ExpandHandle to already have a pending mmap");
 
         // Before releasing the guard and allowing new slices from be acquired, we'll do a last
         // lock of the occ map, to mark the range as free.
         let mut occ_write_guard = self.pool.occ_map.write();
-        let occ_map = &mut *occ_write_guard;
+        let mut free_write_guard = self.pool.free_map.write();
 
-        debug_assert!(occ_map
-            .map
-            .get_or_less(
-                OccOffsetHalf::unused(self.offset()),
-                &occ_map.forest,
-                &RangeOffsetComparator
-            )
-            .map_or(false, |(k, v)| k.offset() < self.offset()
-                && k.offset() + v.size < self.offset() + self.len()));
-        occ_map
-            .map
+        occ_write_guard
             .insert(
-                OccOffsetHalf::unused(self.offset()),
-                OccInfoHalf::with_size(self.len()),
-                &mut occ_map.forest,
-                &RangeOffsetComparator,
+                OccOffset::from_offset_used(self.offset(), false),
+                Size(self.len()),
             )
-            .expect_none("expected newly-acquired slice not to conflict with any existing");
+            .expect_none("expected newly-acquired slice not to conflict with any existing one");
+
+        let updated =
+            free_write_guard.insert(FreeEntry::from_size_offset(self.len(), self.offset()));
+        assert!(updated);
     }
 }
-impl<H, E> BufferPool<H, E>
+impl<I, H, E> BufferPool<I, H, E>
 where
+    I: Integer,
     H: Handle,
     E: Copy,
 {
@@ -628,8 +786,8 @@ where
     /// to insert the new range into the pool.
     pub fn begin_expand(
         &self,
-        additional: u32,
-    ) -> Result<ExpandHandle<'_, H, E>, BeginExpandError> {
+        additional: I,
+    ) -> Result<ExpandHandle<'_, I, H, E>, BeginExpandError> {
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
             // readers to continue acquiring new slices etc, but only allows this thread to be able
@@ -637,44 +795,45 @@ where
             let mmap_intent_guard = self.mmap_map.upgradable_read();
 
             // Get the last mmapped range, no matter whether it's pending or ready to use.
-            let new_offset = mmap_intent_guard
-                .map
-                .get_or_less(
-                    MmapOffsetHalf::ready(0),
-                    &mmap_intent_guard.forest,
-                    // Only compare the offsets, we don't care about it being ready or pending when
-                    // we only want to find the last offset and calculate the next offset from
-                    // that.
-                    &MmapComparatorOffset,
-                )
-                .map_or(
-                    // If there somehow weren't any remaining mmap regions, we just implicitly set the
-                    // next offset to zero.
-                    Ok(0),
-                    |(last_key, last_value)| {
-                        last_key
-                            .offset()
-                            .checked_add(last_value.size)
-                            .ok_or(BeginExpandError)
-                    },
-                )?;
+            let greatest_offset = mmap_intent_guard.last_key_value().map_or(
+                // If there somehow weren't any remaining mmap regions, we just implicitly set the
+                // next offset to zero.
+                Result::<I, BeginExpandError>::Ok(I::zero()),
+                |(last_key, last_value)| {
+                    let start = last_key
+                        .0
+                        .checked_add(last_value.size.0)
+                        .ok_or(BeginExpandError)?;
+                    let _end = start.checked_add(additional).ok_or(BeginExpandError)?;
+                    Ok(start)
+                },
+            );
 
-            if new_offset & MMAP_OFF_OFFSET_MASK != new_offset {
-                // TODO: Reclaim old ranges if possible, rather than failing. Perhaps one could use
-                // a circular ring buffer to allow for O(1) range acquisition, with O(log n)
-                // freeing, if we combine a ring buffer for contiguous ranges, with a B-tree.
-                return Err(BeginExpandError);
-            }
+            let new_offset = match greatest_offset {
+                Ok(o) => o,
+                Err(_) => {
+                    // If we are using small indices, and we run out of new ranges, we have no
+                    // choice but to do an O(n) search to find a new free range. Remember though,
+                    // that these are the mmaps, which are not supposed to be allocated and freed
+                    // that often, so this case is relatively uncommon.
+                    mmap_intent_guard
+                        .iter()
+                        .find_map(|(k, v)| {
+                            let start = k.0.checked_add(v.size.0)?;
+                            let _end = start.checked_add(additional)?;
+                            Some(start)
+                        })
+                        .ok_or(BeginExpandError)?
+                }
+            };
 
             let mut mmap_write_guard = RwLockUpgradableReadGuard::upgrade(mmap_intent_guard);
-            let ref_mut = &mut *mmap_write_guard;
 
             // Insert a new region marked as "pending", with an uninitialized pointer.
-            let new_offset_half = MmapOffsetHalf::pending(new_offset);
-            let new_info_half = MmapInfoHalf::null();
-            ref_mut
-                .map
-                .insert(new_offset_half, new_info_half, &mut ref_mut.forest, &());
+            let new_info = MmapInfo::null();
+            let prev = mmap_write_guard.insert(Offset(new_offset), new_info);
+
+            assert!(prev.is_none());
 
             // Implicitly drop the intent guard, allowing other threads to also expand this buffer
             // pool. There is no race condition here whatsoever, since we have marked our
@@ -710,16 +869,12 @@ where
     /// with the rest of the pool.
     pub fn new(handle: Option<H>) -> Self {
         Self {
-            occ_map: RwLock::new(OccMap {
-                forest: MapForest::new(),
-                map: Map::new(),
-            }),
-            mmap_map: RwLock::new(MmapMap {
-                forest: MapForest::new(),
-                map: Map::new(),
-            }),
+            occ_map: RwLock::new(BTreeMap::new()),
+            mmap_map: RwLock::new(BTreeMap::new()),
+            free_map: RwLock::new(BTreeSet::new()),
             guarded_occ_count: AtomicUsize::new(0),
             handle,
+            options: BufferPoolOptions::default(),
         }
     }
     /// Convenience wrapper over `Arc::new(self)`.
@@ -727,130 +882,188 @@ where
         Arc::new(self)
     }
     // Tries to acquire a buffer slice by inserting an occupied entry into the occ map. The buffer
-    // slice must not be able to span multi mmaps, since their base pointers won't be contiguous.
-    // Returns the range of new newly occupied entry, the range of that entry's mmap, the base
-    // pointer of that entry's mmap, and the extra data associated with the mmap.
+    // slice must not be able to span multiple mmaps, since their base pointers may not be
+    // continuous.  Returns the range of new newly occupied entry, the range of that entry's mmap,
+    // the base pointer of that entry's mmap, and the extra data associated with the mmap.
     fn acquire_slice(
         &self,
-        len: u32,
-        alignment: u32,
-    ) -> Option<(ops::Range<u32>, ops::Range<u32>, *mut u8, E)> {
+        len: I,
+        alignment: I,
+        at: Option<I>,
+    ) -> Option<(ops::Range<I>, I, ops::Range<I>, *mut u8, E)> {
+        let log2_alignment = alignment.clamp(
+            self.options.log2_minimum_alignment,
+            self.options.log2_maximum_alignment,
+        );
+
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
         // threads checking whether it's safe to munmap certain offsets.
-        let intent_guard = self.occ_map.upgradable_read();
+        let occ_intent_guard = self.occ_map.upgradable_read();
+        let free_intent_guard = self.free_map.upgradable_read();
 
-        fn align(off: u32, alignment: u32) -> Option<u32> {
-            assert_ne!(alignment, 0);
+        fn align<I: Integer>(off: I, alignment: I) -> Option<I> {
+            assert_ne!(alignment, I::from(0u8));
             assert!(alignment.is_power_of_two());
 
-            if alignment == 1 {
+            if alignment == I::from(1u8) {
                 return Some(off);
             }
 
-            off.checked_add(alignment - 1)?
+            off.checked_add(alignment - I::from(1u8))?
                 .checked_div(alignment)?
                 .checked_mul(alignment)
         }
 
-        // TODO: Use a better B-tree to prevent O(n) allocation.
-        let (k, _) = intent_guard.map.iter(&intent_guard.forest).find(|(k, v)| {
-            k.is_free()
-                && v.size >= len
-                && align(k.offset(), alignment)
-                    .map_or(false, |aligned| v.size - (aligned - k.offset()) >= len)
-        })?;
+        let (occ_k, occ_v, free_e) = if let Some(at) = at {
+            let (occ_k, occ_v) = occ_intent_guard
+                .range(..=OccOffset::from_offset_used(at, false))
+                .next_back()?;
+            let free_e = free_intent_guard
+                .get(&FreeEntry::from_size_offset(occ_v.0, occ_k.offset()))
+                .expect("expected occ map to contain a corresponding entry for the free entry");
+
+            (occ_k, occ_v, *free_e)
+        } else {
+            let free_e = free_intent_guard.iter().find(|e| {
+                e.size() >= len
+                    && align(e.offset(), alignment)
+                        .map_or(false, |aligned| e.size() - (aligned - e.offset()) >= len)
+            })?;
+            let (occ_k, occ_v) = occ_intent_guard
+                .get_key_value(&OccOffset::from_offset_used(free_e.offset(), false))
+                .expect("expected free map to contain a corresponding entry for the occ entry");
+            (occ_k, occ_v, *free_e)
+        };
+
+        assert!(!occ_k.is_used());
+        assert_eq!(occ_k.offset(), free_e.offset());
+        assert_eq!(
+            I::from(u8::try_from(occ_k.offset().trailing_zeros()).unwrap()),
+            free_e.log2_of_alignment()
+        );
+        assert_eq!(occ_v.0, free_e.size());
+
+        // TODO: Use a better B-tree to prevent O(n) allocation, see following comments (may be
+        // incomplete or wrong).
+
+        /*
+            // Get a new entry to pop from the free space B-tree. The key Ord impl first compares the
+            // size, and then the alignment (or rather log2 of the alignment, but log2 n > log2 m
+            // implies n > m for n,m > 1), in that order. By doing a half-open range with the start,
+            // bound, this will prioritize the smallest size and alignments, reducing pool
+            // fragmentation.
+            //
+            // The alignment is directly calculated based on the number of leading binary zeroes of the
+            // offset (which is the value); in other words, it'll be the largest power of two that
+            // divides the offset.
+            //
+            // Because of that, smaller sizes will be preferred over larger sizes, but
+            let (_, v) = free_intent_guard.range(FreeKey::from_size_align(len, alignment)..)
+        */
+
+        let original_off = free_e.offset();
 
         let aligned_off =
-            align(k.offset(), alignment).expect("bypassed alignment check in iterator");
-        let align_advancement = aligned_off - k.offset();
+            align(original_off, alignment).expect("bypassed alignment check in iterator");
+        assert!(aligned_off < free_e.offset() + free_e.size());
+        let align_advancement = aligned_off - free_e.offset();
 
         let new_offset = {
-            let mut write_guard = RwLockUpgradableReadGuard::upgrade(intent_guard);
-            let occ_map = &mut *write_guard;
+            let mut occ_write_guard = RwLockUpgradableReadGuard::upgrade(occ_intent_guard);
+            let mut free_write_guard = RwLockUpgradableReadGuard::upgrade(free_intent_guard);
 
-            let mut v = occ_map
-                .map
-                .remove(k, &mut occ_map.forest, &RangeOffsetThenUsedComparator)
-                .expect("expected entry not to be removed by itself when acquiring slice");
+            /*let mut occ_v = occ_write_guard
+            .remove(occ_k)
+            .expect("expected entry not to be removed by itself when acquiring slice");*/
 
-            if v.size >= len {
-                // Reinsert the free entry, but with a reduced length.
-                assert!(k.is_free());
-                v.size -= len;
+            let had_prev = free_write_guard.remove(&free_e);
+            assert!(had_prev);
 
-                let k_for_reinsert = OccOffsetHalf::unused(k.offset() + len);
-                occ_map
-                    .map
-                    .insert(
-                        k_for_reinsert,
-                        v,
-                        &mut occ_map.forest,
-                        &RangeOffsetComparator,
-                    )
-                    .expect_none("expected previous entry not to have been reinserted by itself");
+            let prev = occ_write_guard.remove(&OccOffset::from_offset_used(original_off, false));
+            assert!(prev.is_some());
+
+            if free_e.size() > len {
+                let mut upper_free_e = free_e;
+                // Reinsert the upper part of the free range, if the entire range wasn't used.
+                upper_free_e.set_size(upper_free_e.size() - len);
+                upper_free_e.set_offset(upper_free_e.offset() + len);
+
+                let updated = free_write_guard.insert(upper_free_e);
+                assert!(updated);
+
+                let prev = occ_write_guard.insert(
+                    OccOffset::from_offset_used(upper_free_e.offset(), false),
+                    Size(upper_free_e.size()),
+                );
+                assert_eq!(prev, None);
             }
-            if align_advancement > 0 {
+            if align_advancement > I::zero() {
                 // If there was unused space due to alignment, insert that small region marked
                 // unused as well.
-                let k = OccOffsetHalf::unused(k.offset());
-                let v = OccInfoHalf::with_size(align_advancement);
+                let new_free_e = FreeEntry::from_size_offset(align_advancement, original_off);
 
-                occ_map
-                    .map
-                    .insert(k, v, &mut occ_map.forest, &RangeOffsetComparator)
-                    .expect_none("somehow the small alignment region was already mapped");
+                let updated = free_write_guard.insert(new_free_e);
+                assert!(
+                    updated,
+                    "somehow the small alignment region was already mapped"
+                );
+
+                let prev = occ_write_guard.insert(
+                    OccOffset::from_offset_used(original_off, false),
+                    Size(new_free_e.size()),
+                );
+                assert!(prev.is_none());
             }
 
             let new_offset = aligned_off;
-            let new_k = OccOffsetHalf::used(new_offset);
-            let new_v = OccInfoHalf::with_size(len);
-            occ_map
-                .map
-                .insert(new_k, new_v, &mut occ_map.forest, &RangeOffsetComparator)
+            let new_occ_k = OccOffset::from_offset_used(new_offset, true);
+            let new_occ_v = Size(len);
+            occ_write_guard
+                .insert(new_occ_k, new_occ_v)
                 .expect_none("expected new entry not to already be inserted");
 
             new_offset
         };
         let (mmap_range, pointer, extra) = {
-            let read_guard = self.mmap_map.read();
-            let (mmap_k, mmap_v) = read_guard
-                .map
-                .get_or_less(
-                    MmapOffsetHalf::ready(new_offset),
-                    &read_guard.forest,
-                    &MmapComparatorOffset,
-                )
+            let mmap_read_guard = self.mmap_map.read();
+
+            let (mmap_k, mmap_v) = mmap_read_guard
+                .range(..=Offset(new_offset))
+                .next_back()
                 .expect(
                     "expected all free entries in the occ map to have a corresponding mmap entry",
                 );
 
-            let mmap_start = mmap_k.offset();
+            let mmap_start = mmap_k.0;
             let mmap_size = mmap_v.size;
             let mmap_end = mmap_start
-                .checked_add(mmap_size)
-                .expect("expected mmap end not to overflow u32::max_value()");
+                .checked_add(mmap_size.0)
+                .expect("expected mmap end not to overflow u32::MAX");
 
-            assert!(mmap_k.is_ready());
+            assert!(mmap_v.is_init());
             assert!(mmap_start <= new_offset);
             assert!(mmap_end >= new_offset + len);
 
             let (extra, pointer) = unsafe {
-                assert_ne!(mmap_v.size, 0, "expected found slice to not have size zero");
+                assert_ne!(
+                    mmap_v.size.0,
+                    I::zero(),
+                    "expected found slice to not have size zero"
+                );
 
-                // SAFETY: The following assumption is safe, because the size field is what acts
-                // like a tag. Since a real allocation can never have zero size, that zero is
-                // instead used to mark the pointer and extra as initialized. The previous
-                // assertation proves that the mmap *really* is initialized.
+                // SAFETY: The following assumption is safe, because we have already checked that
+                // the pointer is initialized, which implies that the extra field also has to be.
                 let extra = mmap_v.extra.assume_init();
 
                 // SAFETY: Here, we're still manipulating a raw pointer, so there wouldn't really
                 // be unsoundness apart from a possible overflow, but it's also otherwise safe
                 // because we have asserted that the length is nonzero.
                 let base_pointer = mmap_v.addr;
+
                 let pointer = base_pointer
                     .as_ptr()
-                    .add((new_offset - mmap_k.offset()).try_into().unwrap())
+                    .add((new_offset - mmap_k.0).try_into_usize().unwrap())
                     as *mut u8;
 
                 (extra, pointer)
@@ -860,18 +1073,26 @@ where
 
         let offset = aligned_off;
 
-        Some((offset..offset + len, mmap_range, pointer, extra))
+        // TODO
+        let actual_len = len;
+
+        Some((offset..offset + actual_len, len, mmap_range, pointer, extra))
     }
     fn construct_buffer_slice<G: Guard>(
-        alloc_range: ops::Range<u32>,
-        mmap_range: ops::Range<u32>,
+        alloc_range: ops::Range<I>,
+        alloc_len: I,
+        mmap_range: ops::Range<I>,
         pointer: *mut u8,
         extra: E,
-        pool: PoolRefKind<H, E>,
-    ) -> BufferSlice<'_, H, E, G> {
+        pool: PoolRefKind<I, H, E>,
+    ) -> BufferSlice<'_, I, H, E, G> {
+        debug_assert!(alloc_len <= alloc_range.end - alloc_range.start);
+
         BufferSlice {
             alloc_start: alloc_range.start,
-            alloc_size: alloc_range.end - alloc_range.start,
+            alloc_capacity: alloc_range.end - alloc_range.start,
+            alloc_len,
+
             mmap_start: mmap_range.start,
             mmap_size: mmap_range.end - mmap_range.start,
             pointer,
@@ -887,12 +1108,15 @@ where
     /// will free it.
     pub fn acquire_borrowed_slice<G: Guard>(
         &self,
-        len: u32,
-        alignment: u32,
-    ) -> Option<BufferSlice<'_, H, E, G>> {
-        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        len: I,
+        alignment: I,
+        offset: Option<I>,
+    ) -> Option<BufferSlice<'_, I, H, E, G>> {
+        let (alloc_range, alloc_len, mmap_range, pointer, extra) =
+            self.acquire_slice(len, alignment, offset)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
+            alloc_len,
             mmap_range,
             pointer,
             extra,
@@ -907,12 +1131,15 @@ where
     /// of that.
     pub fn acquire_weak_slice<G: Guard>(
         self: &Arc<Self>,
-        len: u32,
-        alignment: u32,
-    ) -> Option<BufferSlice<'static, H, E, G>> {
-        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        len: I,
+        alignment: I,
+        offset: Option<I>,
+    ) -> Option<BufferSlice<'static, I, H, E, G>> {
+        let (alloc_range, alloc_len, mmap_range, pointer, extra) =
+            self.acquire_slice(len, alignment, offset)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
+            alloc_len,
             mmap_range,
             pointer,
             extra,
@@ -920,87 +1147,133 @@ where
         ))
     }
     /// Try to acquire a strongly-borrowed ([`std::sync::Arc`]) slice, that ensures this buffer
-    /// pool cannot be outlived by preventing the pool from being dropped.
+    /// pool cannot be outlived by preventing the whole pool from being dropped.
     ///
     /// These slices can also be guarded, see [`acquire_borrowed_slice`] for a detailed explanation
     /// of that.
     pub fn acquire_strong_slice<G: Guard>(
         self: &Arc<Self>,
-        len: u32,
-        alignment: u32,
-    ) -> Option<BufferSlice<'static, H, E, G>> {
-        let (alloc_range, mmap_range, pointer, extra) = self.acquire_slice(len, alignment)?;
+        len: I,
+        alignment: I,
+        offset: Option<I>,
+    ) -> Option<BufferSlice<'static, I, H, E, G>> {
+        let (alloc_range, alloc_len, mmap_range, pointer, extra) =
+            self.acquire_slice(len, alignment, offset)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
+            alloc_len,
             mmap_range,
             pointer,
             extra,
             PoolRefKind::Strong(Arc::clone(self)),
         ))
     }
-    fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
+    fn remove_free_offset_below(
+        free_map: &mut BTreeSet<FreeEntry<I>>,
+        occ_map: &mut BTreeMap<OccOffset<I>, Size<I>>,
+        mmap_map: &BTreeMap<Offset<I>, MmapInfo<I, E>>,
+        start: &mut I,
+        size: &mut I,
+    ) -> bool {
         let previous_start = *start;
-        let lower_offset = match previous_start.checked_sub(1) {
+        let lower_offset = match previous_start.checked_sub(I::from(1u8)) {
             Some(l) => l,
             None => return false,
         };
 
-        let lower_partial_key = OccOffsetHalf::unused(lower_offset);
-        if let Some((lower_actual_key, lower_value)) =
-            occ_map
-                .map
-                .get_or_less(lower_partial_key, &occ_map.forest, &())
-        {
-            if lower_actual_key.is_used() {
-                return false;
-            }
+        let (cur_mmap_k, cur_mmap_v) = mmap_map
+            .range(..=Offset(previous_start))
+            .next_back()
+            .unwrap();
 
-            if lower_actual_key.offset() + lower_value.size != previous_start {
+        assert!(cur_mmap_k.0 + cur_mmap_v.size.0 > previous_start);
+        assert!(cur_mmap_k.0 <= previous_start);
+
+        // We can't merge free entries faster than O(n), because the obviously have to be coninuous
+        // for that to work, and they are only laid out based on size and alignment. What we can do
+        // though, is to merge the occ map entries if possible, and then indirectly merging the
+        // free entries.
+
+        let lower_occ_partial_k = OccOffset::from_offset_used(lower_offset, false);
+
+        if let Some((lower_occ_k, lower_occ_v)) = occ_map.range(..=lower_occ_partial_k).next_back()
+        {
+            let lower_occ_k = *lower_occ_k;
+            let lower_occ_v = *lower_occ_v;
+
+            assert!(!lower_occ_k.is_used());
+
+            if lower_occ_k.offset() + lower_occ_v.0 != previous_start {
                 // There is another occupied range between these.
                 return false;
             }
-            let v = occ_map
-                .map
-                .remove(
-                    lower_actual_key,
-                    &mut occ_map.forest,
-                    &RangeOffsetThenUsedComparator,
-                )
+
+            let (mmap_k, _) = mmap_map
+                .range(..=Offset(lower_occ_k.offset()))
+                .next_back()
+                .unwrap();
+
+            if mmap_k != cur_mmap_k {
+                // The range cannot be merged as its underlying memory range is not continuous.
+                return false;
+            }
+
+            let lower_occ_v_again = occ_map
+                .remove(&lower_occ_k)
                 .expect("expected previously found key to exist in the b-tree map");
 
-            assert_eq!(v, lower_value);
-            *start = lower_actual_key.offset;
-            *size += lower_value.size;
+            assert_eq!(lower_occ_v_again, lower_occ_v);
+
+            let had_prev = free_map.remove(&FreeEntry::from_size_offset(
+                lower_occ_v.size(),
+                lower_occ_k.offset(),
+            ));
+
+            assert!(had_prev);
+
+            *start = lower_occ_k.offset();
+            *size += lower_occ_v.size();
 
             true
         } else {
             false
         }
     }
-    fn remove_free_offset_above(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
+    fn remove_free_offset_above(
+        free_map: &mut BTreeSet<FreeEntry<I>>,
+        occ_map: &mut BTreeMap<OccOffset<I>, Size<I>>,
+        mmap_map: &BTreeMap<Offset<I>, MmapInfo<I, E>>,
+        start: &mut I,
+        size: &mut I,
+    ) -> bool {
+        if *size == I::from(0u8) {
+            return false;
+        }
+
         let end = *start + *size;
 
-        let higher_key = OccOffsetHalf::unused(end);
+        let higher_occ_k = OccOffset::from_offset_used(end, false);
 
-        if let Some(higher_value) = occ_map.map.get(higher_key, &occ_map.forest, &()) {
-            if higher_key.offset == *start {
-                // The entry was not above the initially freed one.
-                return false;
-            }
+        let (cur_mmap_k, cur_mmap_v) = mmap_map.range(..=Offset(*start)).next_back().unwrap();
 
-            // We don't have to check that there is no range between, since there cannot exist
-            // multiple overlapping ranges (yet).
-            if higher_key.is_used() {
-                return false;
-            }
+        assert!(cur_mmap_k.0 + cur_mmap_v.size.0 > *start);
+        assert!(cur_mmap_k.0 <= *start);
 
-            let v = occ_map
-                .map
-                .remove(higher_key, &mut occ_map.forest, &())
-                .expect("expected previously found key to exist in the b-tree map");
+        if cur_mmap_k.0 + cur_mmap_v.size.0 == *start {
+            // The mmap range ended at the current offset, which makes it impossible to merge the
+            // above offset into a single region, since all occupiable ranges must be continuous.
+            return false;
+        }
 
-            assert_eq!(v, higher_value);
-            *size += higher_value.size;
+        if let Some(higher_occ_v) = occ_map.remove(&higher_occ_k) {
+            let had_prev = free_map.remove(&FreeEntry::from_size_offset(
+                higher_occ_v.size(),
+                higher_occ_k.offset(),
+            ));
+
+            assert!(had_prev);
+
+            *size += higher_occ_v.size();
 
             true
         } else {
@@ -1008,37 +1281,49 @@ where
         }
     }
 
-    unsafe fn reclaim_slice_inner<G: Guard>(&self, slice: &BufferSlice<'_, H, E, G>) {
+    unsafe fn reclaim_slice_inner<G: Guard>(&self, slice: &BufferSlice<'_, I, H, E, G>) {
         let mut occ_write_guard = self.occ_map.write();
-        let occ_map = &mut *occ_write_guard;
+        let mut free_write_guard = self.free_map.write();
 
         let mut start = slice.alloc_start;
-        let mut size = slice.alloc_size;
+        let mut size = slice.alloc_capacity;
 
-        let v = occ_map
-            .map
-            .remove(
-                OccOffsetHalf::used(slice.alloc_start),
-                &mut occ_map.forest,
-                &RangeOffsetComparator,
-            )
+        let occ_v = occ_write_guard
+            .remove(&OccOffset::from_offset_used(start, true))
             .expect("expected occ map to contain buffer slice when reclaiming it");
-        assert_eq!(v.size, slice.alloc_size);
 
-        while Self::remove_free_offset_below(occ_map, &mut start, &mut size) {}
-        while Self::remove_free_offset_above(occ_map, &mut start, &mut size) {}
+        let mmap_guard = self.mmap_map.read();
 
-        occ_map
-            .map
-            .insert(
-                OccOffsetHalf::unused(start),
-                OccInfoHalf::with_size(size),
-                &mut occ_map.forest,
-                &RangeOffsetComparator,
-            )
-            .expect_none(
-                "expected newly resized free range not to start existing again before insertion",
-            );
+        assert_eq!(occ_v.size(), slice.alloc_capacity);
+
+        while Self::remove_free_offset_below(
+            &mut *free_write_guard,
+            &mut *occ_write_guard,
+            &*mmap_guard,
+            &mut start,
+            &mut size,
+        ) {}
+        while Self::remove_free_offset_above(
+            &mut *free_write_guard,
+            &mut *occ_write_guard,
+            &*mmap_guard,
+            &mut start,
+            &mut size,
+        ) {}
+
+        let new_free_e = FreeEntry::from_size_offset(size, start);
+
+        let updated = free_write_guard.insert(new_free_e);
+
+        assert!(
+            updated,
+            "expected newly resized free range not to start existing again before insertion",
+        );
+
+        let new_occ_k = OccOffset::from_offset_used(start, false);
+        let new_occ_v = Size::from_size(size);
+
+        occ_write_guard.insert(new_occ_k, new_occ_v).unwrap_none();
     }
     fn drop_impl(&mut self) {
         let count = self.guarded_occ_count.load(Ordering::Acquire);
@@ -1053,7 +1338,7 @@ where
     }
 }
 
-impl<H: Handle, E: Copy> Drop for BufferPool<H, E> {
+impl<I: Integer, H: Handle, E: Copy> Drop for BufferPool<I, H, E> {
     fn drop(&mut self) {
         self.drop_impl();
     }
@@ -1221,61 +1506,28 @@ mod libc_error_impls {
 mod tests {
     use super::*;
 
-    use std::convert::TryFrom;
     use std::{mem, thread};
 
-    struct TestHandle;
-    impl Handle for TestHandle {
-        fn close(self) -> Result<(), CloseError<()>> {
-            // Who cares about memory leaks in tests anyway?
-            Ok(())
-        }
-    }
-
-    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool<TestHandle, ()>, u32) {
-        let mut mmap_map = MmapMap {
-            map: Map::new(),
-            forest: MapForest::new(),
-        };
-        let mut occ_map = OccMap {
-            map: Map::new(),
-            forest: MapForest::new(),
-        };
+    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool<u32, NoHandle, ()>, u32) {
+        let mut pool = BufferPool::new(None);
         let mut total_size = 0;
 
-        for mut memory in maps {
-            memory.shrink_to_fit();
+        for map in maps {
+            let mut slice = map.into_boxed_slice();
 
-            let (addr, len, _) = memory.into_raw_parts();
-            let size = u32::try_from(len).unwrap();
+            let ptr = slice.as_mut_ptr();
+            let len = slice.len();
 
-            mmap_map.map.insert(
-                MmapOffsetHalf::ready(0),
-                MmapInfoHalf {
-                    size,
-                    addr: NonNull::new(addr).unwrap().into(),
-                    extra: MaybeUninit::new(()),
-                },
-                &mut mmap_map.forest,
-                &(),
-            );
-            occ_map.map.insert(
-                OccOffsetHalf::unused(0),
-                OccInfoHalf::with_size(size),
-                &mut occ_map.forest,
-                &(),
-            );
-            total_size += size;
+            let _raw_slice = Box::into_raw(slice);
+            unsafe {
+                pool.begin_expand(u32::try_from(len).unwrap())
+                    .unwrap()
+                    .initialize(std::ptr::NonNull::new(ptr).unwrap(), ())
+            }
         }
-        let pool = BufferPool {
-            handle: None,
-            mmap_map: RwLock::new(mmap_map),
-            occ_map: RwLock::new(occ_map),
-            guarded_occ_count: AtomicUsize::new(0),
-        };
         (pool, total_size)
     }
-    fn setup_default_pool() -> (BufferPool<TestHandle, ()>, u32) {
+    fn setup_default_pool() -> (BufferPool<u32, NoHandle, ()>, u32) {
         setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]])
     }
 
@@ -1286,7 +1538,7 @@ mod tests {
         let mut slices = Vec::new();
 
         loop {
-            let mut slice = match pool.acquire_borrowed_slice::<NoGuard>(4096, 1) {
+            let mut slice = match pool.acquire_borrowed_slice::<NoGuard>(4096, 1, None) {
                 Some(s) => s,
                 None => break,
             };
@@ -1327,7 +1579,7 @@ mod tests {
                     'retry: loop {
                         let len = thread_rng.gen_range(64, 4096);
                         let align = 1 << thread_rng.gen_range(0, 3);
-                        match pool.acquire_borrowed_slice::<NoGuard>(len, align) {
+                        match pool.acquire_borrowed_slice::<NoGuard>(len, align, None) {
                             Some(_) => break 'retry,
                             None => continue 'retry,
                         }
@@ -1347,7 +1599,7 @@ mod tests {
         let mut slices = Vec::new();
 
         loop {
-            let slice = match pool.acquire_borrowed_slice::<NoGuard>(SIZE, 1) {
+            let slice = match pool.acquire_borrowed_slice::<NoGuard>(SIZE, 1, None) {
                 Some(s) => s,
                 None => break,
             };
@@ -1363,12 +1615,12 @@ mod tests {
         let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
 
         fn get_and_check_slice(
-            pool: &BufferPool<TestHandle, ()>,
+            pool: &BufferPool<u32, NoHandle, ()>,
             size: u32,
             align: u32,
             fill_byte: u8,
-        ) -> BufferSlice<TestHandle, ()> {
-            let mut slice = pool.acquire_borrowed_slice(size, align).unwrap();
+        ) -> BufferSlice<u32, NoHandle, ()> {
+            let mut slice = pool.acquire_borrowed_slice(size, align, None).unwrap();
             assert!(slice.iter().all(|&byte| byte == 0));
             slice.fill(fill_byte);
             assert!(slice.iter().all(|&byte| byte == fill_byte));
@@ -1382,5 +1634,23 @@ mod tests {
             let _aligned_slice = get_and_check_slice(&pool, 128, 128, 0x02);
             let _half_page = get_and_check_slice(&pool, 2048, 2048, 0xFE);
         }
+    }
+    #[test]
+    fn free_entry() {
+        let mut entry = FreeEntry::from_size_offset(1024u32, 64);
+        assert_eq!(entry.size(), 1024);
+        assert_eq!(entry.offset(), 64);
+        assert_eq!(entry.log2_of_alignment(), 6);
+
+        entry.set_offset(128);
+        assert_eq!(entry.size(), 1024);
+        assert_eq!(entry.offset(), 128);
+        assert_eq!(entry.log2_of_alignment(), 7);
+
+        entry.set_offset(3);
+        entry.set_size(4);
+        assert_eq!(entry.size(), 4);
+        assert_eq!(entry.offset(), 3);
+        assert_eq!(entry.log2_of_alignment(), 0);
     }
 }
