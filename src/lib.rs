@@ -6,28 +6,39 @@
 //! allocations.
 //!
 //! The current allocator uses one B-trees to partition the space into regions either marked as
-//! occupied or free. The keys used by the B-tree have a custom comparator, which ensures that
-//! keys for used ranges are orderered after the keys for free ranges. This makes acquiring buffer
-//! slices O(log n) (TODO: Make this O(log n) rather than O(n)).
+//! occupied or free. The keys used by the B-tree have a custom comparator, which ensures that keys
+//! for used ranges are orderered after the keys for free ranges. This, together with having a free
+//! space tree, makes acquiring buffer slices possible in O(log n), provided that there is already
+//! an aligned range (otherwise, it simply does linear search in O(n) until it finds a range large
+//! enough to account for the misalignment).
 
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(missing_docs)]
-#![feature(clamp, option_expect_none, option_unwrap_none, map_first_last)]
+#![deny(clippy::all)]
+#![feature(option_expect_none, option_unwrap_none, map_first_last)]
 #![cfg_attr(test, feature(slice_fill, vec_into_raw_parts))]
 
-use std::borrow::{Borrow, BorrowMut};
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::{TryFrom, TryInto};
-use std::mem::MaybeUninit;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::{cmp, fmt, mem, ops, slice};
+use core::borrow::{Borrow, BorrowMut};
+use core::convert::{TryFrom, TryInto};
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{cmp, fmt, mem, ops, ptr, slice};
 
+extern crate alloc;
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::{Arc, Weak};
+
+#[cfg(any(test, feature = "std"))]
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+
+#[cfg(not(any(test, feature = "std")))]
+use spinning::{RwLock, RwLockUpgradableReadGuard};
 
 mod private {
     pub trait Sealed {}
-    pub trait IntegerRequirements: Sized + From<u8> {
+    pub trait IntegerRequirements: Sized + From<u8> + Copy {
         fn zero() -> Self {
             Self::from(0u8)
         }
@@ -262,7 +273,7 @@ impl Addr {
     fn as_ptr(&self) -> *mut u8 {
         match self {
             Self::Initialized(ptr) => ptr.as_ptr(),
-            Self::Uninitialized => std::ptr::null_mut(),
+            Self::Uninitialized => ptr::null_mut(),
         }
     }
 }
@@ -272,7 +283,6 @@ impl<I, E: Copy> MmapInfo<I, E> {
         matches!(self.addr, Addr::Initialized(_))
     }
 }
-
 
 /// Various options used by the buffer pool mainly to limit the range of possible sizes and
 /// alignments.
@@ -302,7 +312,8 @@ impl<I: Integer> BufferPoolOptions<I> {
 
         let log2_align = alignment.trailing_zeros();
         self.log2_maximum_alignment = log2_align.try_into().unwrap();
-        self.log2_minimum_alignment = std::cmp::min(self.log2_minimum_alignment, self.log2_maximum_alignment);
+        self.log2_minimum_alignment =
+            cmp::min(self.log2_minimum_alignment, self.log2_maximum_alignment);
         self
     }
     /// Reduce the minimum alignment to 1.
@@ -321,7 +332,8 @@ impl<I: Integer> BufferPoolOptions<I> {
 
         let log2_align = alignment.trailing_zeros();
         self.log2_minimum_alignment = log2_align.try_into().unwrap();
-        self.log2_maximum_alignment = std::cmp::max(self.log2_maximum_alignment, self.log2_maximum_alignment);
+        self.log2_maximum_alignment =
+            cmp::max(self.log2_maximum_alignment, self.log2_maximum_alignment);
 
         self
     }
@@ -332,7 +344,7 @@ impl<I: Integer> BufferPoolOptions<I> {
     /// Set the maximum size that allocations can have.
     pub fn with_maximum_size(mut self, size: I) -> Self {
         self.maximum_size = size;
-        self.minimum_size = std::cmp::min(self.minimum_size, self.maximum_size);
+        self.minimum_size = cmp::min(self.minimum_size, self.maximum_size);
         self
     }
     /// Set the minimum size that allocations can have. While this will not affect the lengths of
@@ -340,7 +352,7 @@ impl<I: Integer> BufferPoolOptions<I> {
     /// space that they can optionally expand to.
     pub fn with_minimum_size(mut self, size: I) -> Self {
         self.minimum_size = size;
-        self.maximum_size = std::cmp::max(self.minimum_size, self.maximum_size);
+        self.maximum_size = cmp::max(self.minimum_size, self.maximum_size);
         self
     }
 }
@@ -354,7 +366,7 @@ impl<I: Integer> Default for BufferPoolOptions<I> {
             // Default to system alignment for usize.
             log2_minimum_alignment,
             // Default to unlimited. TODO
-            log2_maximum_alignment: std::cmp::max(log2_minimum_alignment, log2_maximum_alignment),
+            log2_maximum_alignment: cmp::max(log2_minimum_alignment, log2_maximum_alignment),
             maximum_size: I::MAX,
             minimum_size: I::from(1u8),
         }
@@ -518,6 +530,8 @@ where
     /// # Panics
     ///
     /// Like [`as_slice`], this method will panic if the buffer pool has been destroyed.
+    ///
+    /// [`as_slice`]: #method.as_slice
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
         assert!(self.pool_is_alive());
         debug_assert!(self.alloc_capacity >= self.alloc_len);
@@ -569,7 +583,7 @@ where
     /// command for instance, this guard will fail if the buffer is in use by a command, and leak
     /// the memory instead when dropping.
     ///
-    /// This will error with `EEXIST` if there is already an active guard.
+    /// This will error with [`AddGuardError`] if there is already an active guard.
     pub fn guard(&mut self, guard: G) -> Result<(), AddGuardError> {
         if self.guard.is_some() {
             return Err(AddGuardError);
@@ -692,7 +706,7 @@ where
         self.len() == I::zero()
     }
     /// Get the offset of the underlying possibly non-continuously-organized mmap, that was added
-    /// as part of [`BufferPool::expand`].
+    /// as part of [`BufferPool::begin_expand`].
     pub fn mmap_offset(&self) -> I {
         self.mmap_start
     }
@@ -846,6 +860,8 @@ impl<I> Default for AllocationStrategy<I> {
     }
 }
 
+type AcquireSliceRet<I, E> = (ops::Range<I>, I, ops::Range<I>, *mut u8, E);
+
 impl<I, H, E> BufferPool<I, H, E>
 where
     I: Integer,
@@ -969,7 +985,7 @@ where
         len: I,
         alignment: I,
         strategy: AllocationStrategy<I>,
-    ) -> Option<(ops::Range<I>, I, ops::Range<I>, *mut u8, E)> {
+    ) -> Option<AcquireSliceRet<I, E>> {
         assert_ne!(len, I::zero());
 
         if len > self.options.maximum_size {
@@ -979,7 +995,10 @@ where
         if alignment > (I::from(1u8) << self.options.log2_maximum_alignment) {
             return None;
         }
-        let alignment = std::cmp::max(alignment, I::from(1u8) << self.options.log2_minimum_alignment);
+        let alignment = cmp::max(
+            alignment,
+            I::from(1u8) << self.options.log2_minimum_alignment,
+        );
 
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
@@ -1015,16 +1034,30 @@ where
 
             (occ_k, occ_v, *free_e)
         } else {
-            fn find_o_n<I: Integer>(free_map: &BTreeSet<FreeEntry<I>>, len: I, alignment: I) -> Option<&FreeEntry<I>> {
+            fn find_o_n<I: Integer>(
+                free_map: &BTreeSet<FreeEntry<I>>,
+                len: I,
+                alignment: I,
+            ) -> Option<&FreeEntry<I>> {
                 free_map.iter().find(|e| {
                     e.size() >= len
                         && align(e.offset(), alignment)
                             .map_or(false, |aligned| e.size() - (aligned - e.offset()) >= len)
                 })
             }
-            fn find_o_logn<I: Integer>(free_map: &BTreeSet<FreeEntry<I>>, len: I, alignment: I) -> Option<&FreeEntry<I>> {
-                let item = free_map.range(FreeEntry::from_size_offset(len, alignment)..).next()?;
-                if item.size() >= len && align(item.offset(), alignment).map_or(false, |aligned| item.size() - (aligned - item.offset()) >= len) {
+            fn find_o_logn<I: Integer>(
+                free_map: &BTreeSet<FreeEntry<I>>,
+                len: I,
+                alignment: I,
+            ) -> Option<&FreeEntry<I>> {
+                let item = free_map
+                    .range(FreeEntry::from_size_offset(len, alignment)..)
+                    .next()?;
+                if item.size() >= len
+                    && align(item.offset(), alignment).map_or(false, |aligned| {
+                        item.size() - (aligned - item.offset()) >= len
+                    })
+                {
                     Some(item)
                 } else {
                     find_o_n(free_map, len, alignment)
@@ -1237,6 +1270,8 @@ where
     ///
     /// These slices can also be guarded, see [`acquire_borrowed_slice`] for a detailed explanation
     /// of that.
+    ///
+    /// [`acquire_borrowed_slice`]: #method.acquire_borrowed_slice
     pub fn acquire_weak_slice<G: Guard>(
         self: &Arc<Self>,
         len: I,
@@ -1259,6 +1294,8 @@ where
     ///
     /// These slices can also be guarded, see [`acquire_borrowed_slice`] for a detailed explanation
     /// of that.
+    ///
+    /// [`acquire_borrowed_slice`]: #method.acquire_borrowed_slice
     pub fn acquire_strong_slice<G: Guard>(
         self: &Arc<Self>,
         len: I,
@@ -1486,9 +1523,10 @@ impl fmt::Display for AddGuardError {
         )
     }
 }
+#[cfg(any(test, feature = "std"))]
 impl std::error::Error for AddGuardError {}
 
-/// The potential error from [`Bufferslice::with_guard`], indicating that a different guard is
+/// The potential error from [`BufferSlice::with_guard`], indicating that a different guard is
 /// already in use by the the buffer slice. Since that method takes self by value, the old self is
 /// included here, to allow for reuse in case of failure.
 ///
@@ -1513,7 +1551,9 @@ impl<T> fmt::Display for WithGuardError<T> {
         )
     }
 }
+#[cfg(any(test, feature = "std"))]
 impl<T> std::error::Error for WithGuardError<T> {}
+
 impl<T> From<WithGuardError<T>> for AddGuardError {
     fn from(_: WithGuardError<T>) -> Self {
         Self
@@ -1536,6 +1576,8 @@ impl<T> fmt::Debug for ReclaimError<T> {
         f.debug_struct("ReclaimError").finish()
     }
 }
+
+#[cfg(any(test, feature = "std"))]
 impl<T> std::error::Error for ReclaimError<T> {}
 
 /// The error from [`BufferPool::close`], meaning that there is currently a guarded buffer slice in
@@ -1574,6 +1616,8 @@ impl fmt::Display for BeginExpandError {
         )
     }
 }
+
+#[cfg(any(test, feature = "std"))]
 impl std::error::Error for BeginExpandError {}
 
 #[cfg(feature = "redox")]
@@ -1616,7 +1660,10 @@ mod tests {
 
     use std::{mem, thread};
 
-    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>, options: BufferPoolOptions<u32>) -> (BufferPool<u32, NoHandle, ()>, u32) {
+    fn setup_pool(
+        maps: impl IntoIterator<Item = Vec<u8>>,
+        options: BufferPoolOptions<u32>,
+    ) -> (BufferPool<u32, NoHandle, ()>, u32) {
         let pool = BufferPool::new(None);
         let mut total_size = 0;
 
@@ -1638,7 +1685,10 @@ mod tests {
         (pool.with_options(options), total_size)
     }
     fn setup_default_pool(options: BufferPoolOptions<u32>) -> (BufferPool<u32, NoHandle, ()>, u32) {
-        setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]], options)
+        setup_pool(
+            vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]],
+            options,
+        )
     }
 
     #[test]
