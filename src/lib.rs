@@ -583,10 +583,10 @@ where
     /// command for instance, this guard will fail if the buffer is in use by a command, and leak
     /// the memory instead when dropping.
     ///
-    /// This will error with [`AddGuardError`] if there is already an active guard.
-    pub fn guard(&mut self, guard: G) -> Result<(), AddGuardError> {
+    /// This will error with [`WithGuardError`] if there is already an active guard.
+    pub fn guard(&mut self, guard: G) -> Result<(), WithGuardError<G>> {
         if self.guard.is_some() {
-            return Err(AddGuardError);
+            return Err(WithGuardError { this: guard });
         }
         self.guard = Some(guard);
 
@@ -1511,29 +1511,11 @@ pub trait Guard {
     fn try_release(&self) -> bool;
 }
 
-/// The potential error from [`BufferSlice::guard`], indicating that a different guard is already
-/// present.
+/// The potential error from [`BufferSlice::with_guard`] or [`BufferSlice::guard`], indicating that
+/// a different guard is already in use by the the buffer slice. Since that method takes self by
+/// value, the old self is included here, to allow for reuse in case of failure.
 ///
-/// This error corresponds to `EEXIST` if the `redox` feature is enabled.
-#[derive(Debug)]
-pub struct AddGuardError;
-
-impl fmt::Display for AddGuardError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "failed to add guard, due to another guard already existing"
-        )
-    }
-}
-#[cfg(any(test, feature = "std"))]
-impl std::error::Error for AddGuardError {}
-
-/// The potential error from [`BufferSlice::with_guard`], indicating that a different guard is
-/// already in use by the the buffer slice. Since that method takes self by value, the old self is
-/// included here, to allow for reuse in case of failure.
-///
-/// Like the [`AddGuardError`], this corresponds to `EEXIST` if the `redox` feature is enabled.
+/// This corresponds to `EEXIST` if the `redox` feature is enabled.
 pub struct WithGuardError<T> {
     /// The self passed by value that could have it's guard type replaced.
     pub this: T,
@@ -1557,11 +1539,6 @@ impl<T> fmt::Display for WithGuardError<T> {
 #[cfg(any(test, feature = "std"))]
 impl<T> std::error::Error for WithGuardError<T> {}
 
-impl<T> From<WithGuardError<T>> for AddGuardError {
-    fn from(_: WithGuardError<T>) -> Self {
-        Self
-    }
-}
 /// The potential error from [`BufferSlice::reclaim`], caused by the slice being guarded.
 ///
 /// This error is convertible to `EADDRINUSE`, if the `redox` feature is enabled.
@@ -1647,11 +1624,6 @@ mod libc_error_impls {
     }
     impl<T> From<WithGuardError<T>> for Error {
         fn from(_: WithGuardError<T>) -> Error {
-            Error::new(EEXIST)
-        }
-    }
-    impl From<AddGuardError> for Error {
-        fn from(_: AddGuardError) -> Error {
             Error::new(EEXIST)
         }
     }
