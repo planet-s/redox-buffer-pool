@@ -11,6 +11,7 @@ repository = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git"
 license = "MIT"
 keywords = ["redox", "buffer-pool"]
 categories = ["data-structures", "memory-management"]
+exclude = ["target"]
 
 [features]
 default = ["std"]
