@@ -37,8 +37,35 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use spinning::{RwLock, RwLockUpgradableReadGuard};
 
 mod private {
+    use core::{fmt, ops};
+
     pub trait Sealed {}
-    pub trait IntegerRequirements: Sized + From<u8> + Copy {
+    pub trait IntegerRequirements:
+        Sized
+        + From<u8>
+        + Copy
+        + Clone
+        + fmt::Debug
+        + fmt::Display
+        + Eq
+        + PartialEq<Self>
+        + PartialOrd<Self>
+        + Ord
+        + From<u8>
+        + ops::Add<Self, Output = Self>
+        + ops::AddAssign
+        + ops::Sub<Self, Output = Self>
+        + ops::Shl<u8, Output = Self>
+        + ops::Shl<u32, Output = Self>
+        + ops::Shr<u8, Output = Self>
+        + ops::Shr<u32, Output = Self>
+        + ops::Not<Output = Self>
+        + ops::BitAnd<Output = Self>
+        + ops::BitAndAssign
+        + ops::BitOr<Output = Self>
+        + ops::BitOrAssign
+        + ops::BitXor<Self, Output = Self>
+    {
         fn zero() -> Self {
             Self::from(0u8)
         }
@@ -56,42 +83,7 @@ mod private {
 
 /// A type that can be used as offsets and lengths within a buffer pool. The default integer is
 /// u32.
-pub unsafe trait Integer:
-
-    // TODO: I don't like big dependencies, but maybe we should use num-traits for this?
-
-    private::Sealed
-    + private::IntegerRequirements
-
-    + Sized
-    + Copy
-    + Clone
-    + fmt::Debug
-    + fmt::Display
-
-    + Eq
-    + PartialEq<Self>
-    + PartialOrd<Self>
-    + Ord
-
-    + From<u8>
-
-    + ops::Add<Self, Output = Self>
-    + ops::AddAssign
-    + ops::Sub<Self, Output = Self>
-
-    + ops::Shl<u8, Output = Self>
-    + ops::Shl<u32, Output = Self>
-    + ops::Shr<u8, Output = Self>
-    + ops::Shr<u32, Output = Self>
-    + ops::Not<Output = Self>
-    + ops::BitAnd<Output = Self>
-    + ops::BitAndAssign
-    + ops::BitOr<Output = Self>
-    + ops::BitOrAssign
-    + ops::BitXor<Self, Output = Self>
-{
-}
+pub unsafe trait Integer: private::Sealed + private::IntegerRequirements {}
 fn occ_map_ready_shift<I: Integer>() -> u32 {
     let bit_count = (mem::size_of::<I>() * 8) as u32;
     bit_count - 1
@@ -375,7 +367,7 @@ impl<I: Integer> Default for BufferPoolOptions<I> {
 
 /// A buffer pool, featuring a general-purpose 32-bit allocator, and slice guards.
 // TODO: Expand doc
-pub struct BufferPool<I: Integer, H: Handle, E: Copy> {
+pub struct BufferPool<I: Integer, H: Handle<I, E>, E: Copy> {
     handle: Option<H>,
 
     options: BufferPoolOptions<I>,
@@ -392,13 +384,19 @@ pub struct BufferPool<I: Integer, H: Handle, E: Copy> {
     // also be io_uring "pool" shared memory or physalloc+physmap DMA allocations.
     mmap_map: RwLock<BTreeMap<Offset<I>, MmapInfo<I, E>>>,
 }
-unsafe impl<I: Integer + Send + Sync, H: Send + Handle, E: Copy> Send for BufferPool<I, H, E> {}
-unsafe impl<I: Integer + Send + Sync, H: Sync + Handle, E: Copy> Sync for BufferPool<I, H, E> {}
+unsafe impl<I: Integer + Send + Sync, H: Send + Handle<I, E>, E: Copy> Send
+    for BufferPool<I, H, E>
+{
+}
+unsafe impl<I: Integer + Send + Sync, H: Sync + Handle<I, E>, E: Copy> Sync
+    for BufferPool<I, H, E>
+{
+}
 
 impl<I, H, E> fmt::Debug for BufferPool<I, H, E>
 where
     I: Integer,
-    H: fmt::Debug + Handle,
+    H: fmt::Debug + Handle<I, E>,
     E: Copy,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -421,8 +419,13 @@ impl Guard for NoGuard {
 /// pool struct.
 pub enum NoHandle {}
 
-impl Handle for NoHandle {
-    fn close(self) -> Result<(), CloseError<()>> {
+impl<I, E> Handle<I, E> for NoHandle
+where
+    E: Copy,
+{
+    type Error = ::core::convert::Infallible;
+
+    fn close(self, _entries: MmapEntries<I, E>) -> Result<(), Self::Error> {
         unreachable!("NoHandle cannot be initialized")
     }
 }
@@ -431,7 +434,7 @@ impl Handle for NoHandle {
 // exclusive, while a higher refcount would mean shared.
 #[derive(Debug)]
 /// A slice from the buffer pool, that can be read from or written to as a regular smart pointer.
-pub struct BufferSlice<'a, I: Integer, H: Handle, E: Copy, G: Guard = NoGuard> {
+pub struct BufferSlice<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard = NoGuard> {
     alloc_start: I,
     alloc_capacity: I,
     alloc_len: I,
@@ -446,12 +449,12 @@ pub struct BufferSlice<'a, I: Integer, H: Handle, E: Copy, G: Guard = NoGuard> {
 }
 
 #[derive(Debug)]
-enum PoolRefKind<'a, I: Integer, H: Handle, E: Copy> {
+enum PoolRefKind<'a, I: Integer, H: Handle<I, E>, E: Copy> {
     Ref(&'a BufferPool<I, H, E>),
     Strong(Arc<BufferPool<I, H, E>>),
     Weak(Weak<BufferPool<I, H, E>>),
 }
-impl<'a, I: Integer, H: Handle, E: Copy> Clone for PoolRefKind<'a, I, H, E> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy> Clone for PoolRefKind<'a, I, H, E> {
     fn clone(&self) -> Self {
         match *self {
             Self::Ref(r) => Self::Ref(r),
@@ -464,7 +467,7 @@ impl<'a, I: Integer, H: Handle, E: Copy> Clone for PoolRefKind<'a, I, H, E> {
 unsafe impl<'a, I, H, E, G> Send for BufferSlice<'a, I, H, E, G>
 where
     I: Integer,
-    H: Send + Sync + Handle,
+    H: Send + Sync + Handle<I, E>,
     E: Copy + Send,
     G: Send + Guard,
 {
@@ -472,7 +475,7 @@ where
 unsafe impl<'a, I, H, E, G> Sync for BufferSlice<'a, I, H, E, G>
 where
     I: Integer,
-    H: Send + Sync + Handle,
+    H: Send + Sync + Handle<I, E>,
     E: Copy + Sync,
     G: Sync + Guard,
 {
@@ -481,7 +484,7 @@ where
 impl<'a, I, H, E, G> BufferSlice<'a, I, H, E, G>
 where
     I: Integer,
-    H: Handle,
+    H: Handle<I, E>,
     E: Copy,
     G: Guard,
 {
@@ -724,7 +727,7 @@ where
     I: Integer,
     G: Guard,
     E: Copy,
-    H: Handle,
+    H: Handle<I, E>,
 {
     fn drop(&mut self) {
         match self.reclaim_inner() {
@@ -735,34 +738,46 @@ where
         }
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> ops::Deref for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> ops::Deref
+    for BufferSlice<'a, I, H, E, G>
+{
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> ops::DerefMut for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> ops::DerefMut
+    for BufferSlice<'a, I, H, E, G>
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> Borrow<[u8]> for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> Borrow<[u8]>
+    for BufferSlice<'a, I, H, E, G>
+{
     fn borrow(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> BorrowMut<[u8]> for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> BorrowMut<[u8]>
+    for BufferSlice<'a, I, H, E, G>
+{
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> AsRef<[u8]> for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> AsRef<[u8]>
+    for BufferSlice<'a, I, H, E, G>
+{
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'a, I, H, E, G> {
+impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> AsMut<[u8]>
+    for BufferSlice<'a, I, H, E, G>
+{
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
@@ -770,7 +785,7 @@ impl<'a, I: Integer, H: Handle, E: Copy, G: Guard> AsMut<[u8]> for BufferSlice<'
 /// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
 /// method, the range has already been reserved, so it's up to this handle to initialize it.
 // TODO: Reclaim pending slice upon Drop or a fallible cancel method.
-pub struct ExpandHandle<'a, I: Integer, H: Handle, E: Copy> {
+pub struct ExpandHandle<'a, I: Integer, H: Handle<I, E>, E: Copy> {
     offset: I,
     len: I,
     pool: &'a BufferPool<I, H, E>,
@@ -778,7 +793,7 @@ pub struct ExpandHandle<'a, I: Integer, H: Handle, E: Copy> {
 impl<'a, I, H, E> ExpandHandle<'a, I, H, E>
 where
     I: Integer,
-    H: Handle,
+    H: Handle<I, E>,
     E: Copy,
 {
     /// Get the length of the range that has been reserved for this specific allocation.
@@ -865,7 +880,7 @@ type AcquireSliceRet<I, E> = (ops::Range<I>, I, ops::Range<I>, *mut u8, E);
 impl<I, H, E> BufferPool<I, H, E>
 where
     I: Integer,
-    H: Handle,
+    H: Handle<I, E>,
     E: Copy,
 {
     /// Begin a buffer pool expansion, by reserving a new not-yet-usable "pending" mmap region.
@@ -1478,7 +1493,11 @@ where
 
         if count == 0 {
             if let Some(h) = self.handle.take() {
-                let _ = h.close();
+                // This won't allocate, since the new mmap is entry.
+                let entries = mem::replace(&mut *self.mmap_map.write(), BTreeMap::new());
+                let _ = h.close(MmapEntries {
+                    inner: entries.into_iter(),
+                });
             }
         } else {
             log::warn!("Leaking entire buffer pool, since there were {} slices that were guarded by futures that haven't been completed", count);
@@ -1486,19 +1505,94 @@ where
     }
 }
 
-impl<I: Integer, H: Handle, E: Copy> Drop for BufferPool<I, H, E> {
+impl<I: Integer, H: Handle<I, E>, E: Copy> Drop for BufferPool<I, H, E> {
     fn drop(&mut self) {
         self.drop_impl();
     }
 }
 
+/// The iterator given to the close handle, or optionally retrieved by manually destroying a buffer
+/// pool, that contains all the underlying allocations that the pool has been expanded with.
+///
+/// The iterator yields [`MmapEntry`].
+#[derive(Debug)]
+pub struct MmapEntries<I, E: Copy> {
+    inner: ::alloc::collections::btree_map::IntoIter<Offset<I>, MmapInfo<I, E>>,
+}
+/// The entry type from the [`MmapEntries`] iterator, that contains all the information that the
+/// buffer pool had about that mmap, when it's being destroyed.
+///
+/// Only handles that were actually initialized here, are listed. A reserved range that was still
+/// pending when this iterator was created, that had its expansion handle dropped, will not be
+/// included in the iterator.
+#[derive(Debug)]
+pub struct MmapEntry<I, E> {
+    /// The internally allocated offset within the buffer pool, where the mmap was put.
+    pub pool_offset: I,
+
+    /// The size that the mmap allocation had. This is exactly the same as the size inputted as
+    /// part of [`BufferPool::begin_expand`].
+    pub size: I,
+
+    /// The pointer that was given as part of [`ExpandHandle::initialize`].
+    ///
+    /// This pointer is _guaranteed_ to be a valid allocation of size [`size`], so long as the
+    /// allocation given to the pool as part of [`ExpandHandle::initialize`] was valid (which would
+    /// immediately be undefined behavior in the first case).
+    ///
+    /// [`size`]: #structfield.size
+    pub pointer: NonNull<u8>,
+
+    /// The extra field that was also supplied to [`ExpandHandle::initialize`].
+    pub extra: E,
+}
+impl<I, E> Iterator for MmapEntries<I, E>
+where
+    E: Copy,
+{
+    type Item = MmapEntry<I, E>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        'entries: loop {
+            let (offset, info) = self.inner.next()?;
+
+            let pointer = match info.addr {
+                Addr::Initialized(pointer) => pointer,
+                Addr::Uninitialized => continue 'entries,
+            };
+
+            return Some(MmapEntry {
+                pool_offset: offset.0,
+                size: info.size.0,
+                pointer,
+
+                // SAFETY: The following unsafe block is safe, because the MmapInfo struct is
+                // organized in a way that the address enum indicates whether nor not the struct
+                // has been initialized. Since the earlier match statement has already checked that
+                // the pointer be initialized, and thus the struct, we can assume_init here.
+                extra: unsafe { info.extra.assume_init() },
+            });
+        }
+    }
+}
+
 /// The requirement of a handle to be able to be passed into the buffer pool.
-pub trait Handle {
-    /// The only requirement for a handle, is that the handle should provide this method to allow
-    /// closing the underlying memory, if that memory came from this handle.
+///
+/// This trait is only currently used in the destructor of the buffer pool, after all the ranges
+/// have been validated not to be in use by an active guard.
+pub trait Handle<I, E: Copy> {
+    /// The possible error that may occur when freeing one or more mmap entries. This error type is
+    /// forwarded to the buffer pool when this handle is used, which only currently happens in the
+    /// destructor of [`BufferPool`].
+    type Error;
+
+    /// The function called when a buffer pool is dropped.
+    ///
+    /// All the mmap ranges (originating from [`begin_expand`]) that have been initialized, are
+    /// also included here
     ///
     /// This method is optional to implement; it's completely ok to simply return `Ok(())` here.
-    fn close(self) -> Result<(), CloseError<()>>;
+    fn close(self, mmap_entries: MmapEntries<I, E>) -> Result<(), Self::Error>;
 }
 /// The requirement of a guard to a slice. Guards can optionally prevent slices from being
 /// reclaimed; the slices have a fallible [`BufferSlice::reclaim`] method, but their `Drop` impl
