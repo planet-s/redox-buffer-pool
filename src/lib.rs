@@ -1845,7 +1845,7 @@ mod tests {
         // work when there are multiple threads constantly trying to acquire and release slices.
 
         let (pool, _) = setup_default_pool(Default::default());
-        let pool = pool.shared();
+        let pool = Arc::new(pool);
 
         const THREAD_COUNT: usize = 8;
 
