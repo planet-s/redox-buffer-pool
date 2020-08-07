@@ -978,7 +978,7 @@ where
     ///
     /// If there are any pending commands that have guarded buffer slices from this pool, the
     /// entire memory will be leaked, for now.
-    pub fn close(mut self) -> CloseResult<I, H, E> {
+    pub fn try_close(mut self) -> CloseResult<I, H, E> {
         if self.guarded_occ_count.load(Ordering::Acquire) > 0 {
             // TODO: Free as much memory as possible when this happens, rather than the entire
             // pool. This may add unnecessary overhead though, if a separate guard count would be
@@ -1010,10 +1010,6 @@ where
     pub fn with_options(mut self, options: BufferPoolOptions<I>) -> Self {
         self.options = options;
         self
-    }
-    /// Convenience wrapper over `Arc::new(self)`.
-    pub fn shared(self) -> Arc<Self> {
-        Arc::new(self)
     }
     // Tries to acquire a buffer slice by inserting an occupied entry into the occ map. The buffer
     // slice must not be able to span multiple mmaps, since their base pointers may not be
@@ -1533,6 +1529,12 @@ where
         } else {
             log::warn!("Leaking parts of the buffer pool, since there were {} slices that were guarded by futures that haven't been completed", count);
         }
+    }
+    /// Returns the number of active guards that are used in the pool.
+    ///
+    /// This method is O(1) and doesn't count anything; it simply fetches an internal counter.
+    pub fn active_guard_count(&self) -> usize {
+        self.guarded_occ_count.load(Ordering::Relaxed)
     }
 }
 
