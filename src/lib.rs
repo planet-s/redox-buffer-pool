@@ -19,10 +19,11 @@
 #![cfg_attr(test, feature(slice_fill, vec_into_raw_parts))]
 
 use core::borrow::{Borrow, BorrowMut};
+use core::cell::UnsafeCell;
 use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::{cmp, fmt, mem, ops, ptr, slice};
 
 extern crate alloc;
@@ -239,40 +240,24 @@ impl<I: Integer> PartialOrd for OccOffset<I> {
     }
 }
 
-impl<I: Integer, E: Copy> MmapInfo<I, E> {
-    fn null() -> Self {
-        Self {
-            addr: Addr::Uninitialized,
-            extra: MaybeUninit::uninit(),
-            size: Size::from_size(I::zero()),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MmapInfo<I, E: Copy> {
+struct MmapInfo<I, E> {
     size: Size<I>,
-    extra: MaybeUninit<E>,
-    addr: Addr,
-}
-#[derive(Clone, Copy, Debug)]
-enum Addr {
-    Initialized(NonNull<u8>),
-    Uninitialized,
+
+    // TODO: Perhaps we should use a safe abstraction for one-time initializations, like once_cell
+    // or `Once` from `spin` and `spinning`.
+    extra: UnsafeCell<MaybeUninit<E>>,
+    addr: AtomicPtr<u8>,
 }
 
-impl Addr {
-    fn as_ptr(&self) -> *mut u8 {
-        match self {
-            Self::Initialized(ptr) => ptr.as_ptr(),
-            Self::Uninitialized => ptr::null_mut(),
-        }
-    }
-}
-
-impl<I, E: Copy> MmapInfo<I, E> {
-    fn is_init(&self) -> bool {
-        matches!(self.addr, Addr::Initialized(_))
+impl<I, E> fmt::Debug for MmapInfo<I, E>
+where
+    I: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmapInfo")
+            .field("size", &self.size)
+            .field("addr", &self.addr.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -384,6 +369,8 @@ where
     // coarse-grained locks.
     //
 
+    // TODO: Maybe store the occ map and free map within the same lock?
+
     // Occupied entries, mapped offset + used => size.
     occ_map: RwLock<BTreeMap<OccOffset<I>, Size<I>>>,
     // Free entries containing size+align+offset, in that order.
@@ -477,7 +464,7 @@ where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    T: AsRef<BufferPool<I, H, E>>
+    T: AsRef<BufferPool<I, H, E>>,
 {
     fn as_buffer_pool(&self) -> &BufferPool<I, H, E> {
         self.as_ref()
@@ -515,7 +502,6 @@ where
     // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
     // exclusive, while a higher refcount would mean shared.
     //
-
     alloc_start: I,
     alloc_capacity: I,
     alloc_len: I,
@@ -904,7 +890,7 @@ where
 /// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
 /// method, the range has already been reserved, so it's up to this handle to initialize it.
 // TODO: Reclaim pending slice upon Drop or a fallible cancel method.
-pub struct ExpandHandle<'pool, I, H, E>
+pub struct ExpansionHandle<'pool, I, H, E>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -914,7 +900,7 @@ where
     len: I,
     pool: &'pool BufferPool<I, H, E>,
 }
-impl<'pool, I, H, E> ExpandHandle<'pool, I, H, E>
+impl<'pool, I, H, E> ExpansionHandle<'pool, I, H, E>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -942,22 +928,37 @@ where
     /// originally inputted. The allocation must have the static lifetime, so pointers to the stack
     /// obviously don't apply here.
     pub unsafe fn initialize(self, pointer: NonNull<u8>, extra: E) {
-        let mut mmap_write_guard = self.pool.mmap_map.write();
+        // Begin with updating the mmap entry, to contain the new pointer.
+        {
+            let mmap_read_guard = self.pool.mmap_map.read();
 
-        let key = Offset(self.offset());
+            let key = Offset(self.offset());
 
-        let new_initialized_value = MmapInfo {
-            addr: Addr::Initialized(pointer),
-            size: Size::from_size(self.len()),
-            extra: MaybeUninit::new(extra),
-        };
+            let value = mmap_read_guard
+                .get(&key)
+                .expect("expected ExpansionHandle to already have a pending mmap");
 
-        mmap_write_guard
-            .insert(key, new_initialized_value)
-            .expect("expected ExpandHandle to already have a pending mmap");
+            // SAFETY: The following is safe, because we can trust the allocator to __never__ alias
+            // expansion handles, which wouldn't really make sense in any case. While we cannot
+            // guarantee that we have exclusive ownership to this handle, since it's stored openly
+            // together with every other mmap entry, we can however guarantee that readers will not
+            // unsafely access this field, without having read the pointer that wasn't null.
+            ptr::write(value.extra.get(), MaybeUninit::new(extra));
 
-        // Before releasing the guard and allowing new slices from be acquired, we'll do a last
-        // lock of the occ map, to mark the range as free.
+            // Store the pointer that we just specified, into the addr field of the mmap entry. This
+            // will transition the mmap entry from the state "pending" into the state "ready", which is
+            // indicated by the pointer being null or not (and the input value here is type-checked not
+            // to be null). While this store is not unsafe, we uphold the necessary invariants by
+            // already having set the extra field.
+            //
+            // The release ordering will guarantee that the newly-updated extra value, be synchronized
+            // to every thread that reads the pointer (which they must do to access it; otherwise it's
+            // "pending" and the allocator will skip it until it becomes ready).
+            value.addr.store(pointer.as_ptr(), Ordering::Release);
+        }
+
+        // Before releasing the guard and allowing new slices to be acquired, we'll do a last lock
+        // of the occ map, to mark the range as free.
         let mut occ_write_guard = self.pool.occ_map.write();
         let mut free_write_guard = self.pool.free_map.write();
 
@@ -971,6 +972,23 @@ where
         let updated =
             free_write_guard.insert(FreeEntry::from_size_offset(self.len(), self.offset()));
         assert!(updated);
+
+        // This is important because the Drop impl is only there to unreserve the range if it was
+        // never used, so dropping here implicitly would then immediately remove it!
+        mem::forget(self);
+    }
+}
+impl<'pool, I, H, E> Drop for ExpansionHandle<'pool, I, H, E>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+{
+    fn drop(&mut self) {
+        let key = Offset(self.offset());
+
+        let mut mmap_write_guard = self.pool.mmap_map.write();
+        let _ = mmap_write_guard.remove(&key);
     }
 }
 /// The strategy to use when allocating, with tradeoffs between heap fragmentation, and the
@@ -1012,15 +1030,26 @@ where
     E: Copy,
 {
     /// Begin a buffer pool expansion, by reserving a new not-yet-usable "pending" mmap region.
+    ///
     /// Internally, this will use an intent lock, so while there can be multiple parallel
     /// expansions in the actual allocation phase, the process of finding a new range within the
     /// pool for allocation, can only have one writer at a time. That said, readers of this pool
     /// will still be able to function correctly, and the only critical exclusive section, is only
     /// to insert the new range into the pool.
+    ///
+    /// Note that this type will only give a handle to the reserved range, that will lazily
+    /// initialize it. This method will only _reserve_ a range.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the size inputted, is zero.
+    #[must_use = "calling begin_expand alone only reserves a range; you need to allocate some actually memory, using the handle"]
     pub fn begin_expand(
         &self,
         additional: I,
-    ) -> Result<ExpandHandle<'_, I, H, E>, BeginExpandError> {
+    ) -> Result<ExpansionHandle<'_, I, H, E>, BeginExpandError> {
+        assert_ne!(additional, I::zero());
+
         let new_offset = {
             // Get an intent guard (in other words, upgradable read guard), which allows regular
             // readers to continue acquiring new slices etc, but only allows this thread to be able
@@ -1029,8 +1058,8 @@ where
 
             // Get the last mmapped range, no matter whether it's pending or ready to use.
             let greatest_offset = mmap_intent_guard.last_key_value().map_or(
-                // If there somehow weren't any remaining mmap regions, we just implicitly set the
-                // next offset to zero.
+                // If there somehow weren't any mmap regions, we just implicitly set the next
+                // offset to zero.
                 Result::<I, BeginExpandError>::Ok(I::zero()),
                 |(last_key, last_value)| {
                     let start = last_key
@@ -1063,7 +1092,11 @@ where
             let mut mmap_write_guard = RwLockUpgradableReadGuard::upgrade(mmap_intent_guard);
 
             // Insert a new region marked as "pending", with an uninitialized pointer.
-            let new_info = MmapInfo::null();
+            let new_info = MmapInfo {
+                addr: AtomicPtr::new(ptr::null_mut()),
+                extra: UnsafeCell::new(MaybeUninit::uninit()),
+                size: Size::from_size(additional),
+            };
             let prev = mmap_write_guard.insert(Offset(new_offset), new_info);
 
             assert!(prev.is_none());
@@ -1073,7 +1106,7 @@ where
             // prereserved range as "pending".
             new_offset
         };
-        Ok(ExpandHandle {
+        Ok(ExpansionHandle {
             offset: new_offset,
             len: additional,
             pool: self,
@@ -1127,7 +1160,7 @@ where
     }
     // Tries to acquire a buffer slice by inserting an occupied entry into the occ map. The buffer
     // slice must not be able to span multiple mmaps, since their base pointers may not be
-    // continuous.  Returns the range of new newly occupied entry, the range of that entry's mmap,
+    // continuous. Returns the range of new newly occupied entry, the range of that entry's mmap,
     // the base pointer of that entry's mmap, and the extra data associated with the mmap.
     fn acquire_slice(
         &self,
@@ -1273,10 +1306,6 @@ where
             let mut occ_write_guard = RwLockUpgradableReadGuard::upgrade(occ_intent_guard);
             let mut free_write_guard = RwLockUpgradableReadGuard::upgrade(free_intent_guard);
 
-            /*let mut occ_v = occ_write_guard
-            .remove(occ_k)
-            .expect("expected entry not to be removed by itself when acquiring slice");*/
-
             let had_prev = free_write_guard.remove(&free_e);
             assert!(had_prev);
 
@@ -1341,7 +1370,6 @@ where
                 .checked_add(mmap_size.0)
                 .expect("expected mmap end not to overflow u32::MAX");
 
-            assert!(mmap_v.is_init());
             assert!(mmap_start <= new_offset);
             assert!(mmap_end >= new_offset + len);
 
@@ -1352,19 +1380,22 @@ where
                     "expected found slice to not have size zero"
                 );
 
-                // SAFETY: The following assumption is safe, because we have already checked that
-                // the pointer is initialized, which implies that the extra field also has to be.
-                let extra = mmap_v.extra.assume_init();
+                // The acquire ordering will synchronize the extra field set in the UnsafeCell.
+                let base_pointer: *mut u8 = mmap_v.addr.load(Ordering::Acquire);
 
-                // SAFETY: Here, we're still manipulating a raw pointer, so there wouldn't really
-                // be unsoundness apart from a possible overflow, but it's also otherwise safe
-                // because we have asserted that the length is nonzero.
-                let base_pointer = mmap_v.addr;
+                assert!(!base_pointer.is_null());
 
-                let pointer = base_pointer
-                    .as_ptr()
-                    .add((new_offset - mmap_k.0).try_into_usize().unwrap())
-                    as *mut u8;
+                // SAFETY: assume_init is safe, because we have already checked that the pointer is
+                // initialized (non-null), which implies that the extra field also has to be.
+                // SAFETY: It's completely safe to read from the UnsafeCell directly, both because
+                // the type is Copy, which prevents the destructor from doing the wrong thing, and
+                // the value has been synchronized.
+                // SAFETY: It's not aliasable either, since only the expansion handles are allowed
+                // to touch the unsafe cell, provided that the pointer is null.
+                let extra = ptr::read(mmap_v.extra.get()).assume_init();
+
+                let pointer =
+                    base_pointer.add((new_offset - mmap_start).try_into_usize().unwrap()) as *mut u8;
 
                 (extra, pointer)
             };
@@ -1406,12 +1437,15 @@ where
     /// guard protecting the slice at that time. If there is, the memory will be leaked instead,
     /// and the pool will not be able to use the offset, as it will be marked "occpied" and nothing
     /// will free it.
-    pub fn acquire_borrowed_slice<G: Guard>(
+    pub fn acquire_borrowed_slice<G>(
         &self,
         len: I,
         alignment: I,
         strategy: AllocationStrategy<I>,
-    ) -> Option<BufferSlice<'_, I, H, E, G>> {
+    ) -> Option<BufferSlice<'_, I, H, E, G>>
+    where
+        G: Guard,
+    {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
             self.acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
@@ -1441,8 +1475,9 @@ where
         G: Guard,
         C: AsBufferPool<I, H, E>,
     {
-        let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            this.as_buffer_pool().acquire_slice(len, alignment, strategy)?;
+        let (alloc_range, alloc_len, mmap_range, pointer, extra) = this
+            .as_buffer_pool()
+            .acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
@@ -1469,8 +1504,9 @@ where
         G: Guard,
         C: AsBufferPool<I, H, E>,
     {
-        let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            this.as_buffer_pool().acquire_slice(len, alignment, strategy)?;
+        let (alloc_range, alloc_len, mmap_range, pointer, extra) = this
+            .as_buffer_pool()
+            .acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
@@ -1675,7 +1711,10 @@ impl<I: Integer, H: Handle<I, E>, E: Copy> Drop for BufferPool<I, H, E> {
 ///
 /// The iterator yields [`MmapEntry`].
 #[derive(Debug)]
-pub struct MmapEntries<I, E: Copy> {
+pub struct MmapEntries<I, E>
+where
+    E: Copy,
+{
     inner: ::alloc::collections::btree_map::IntoIter<Offset<I>, MmapInfo<I, E>>,
 }
 /// The entry type from the [`MmapEntries`] iterator, that contains all the information that the
@@ -1693,16 +1732,16 @@ pub struct MmapEntry<I, E> {
     /// part of [`BufferPool::begin_expand`].
     pub size: I,
 
-    /// The pointer that was given as part of [`ExpandHandle::initialize`].
+    /// The pointer that was given as part of [`ExpansionHandle::initialize`].
     ///
     /// This pointer is _guaranteed_ to be a valid allocation of size [`size`], so long as the
-    /// allocation given to the pool as part of [`ExpandHandle::initialize`] was valid (which would
-    /// immediately be undefined behavior in the first case).
+    /// allocation given to the pool as part of [`ExpansionHandle::initialize`] was valid (which
+    /// would immediately be undefined behavior in the first case).
     ///
     /// [`size`]: #structfield.size
     pub pointer: NonNull<u8>,
 
-    /// The extra field that was also supplied to [`ExpandHandle::initialize`].
+    /// The extra field that was also supplied to [`Expansion::initialize`].
     pub extra: E,
 }
 impl<I, E> Iterator for MmapEntries<I, E>
@@ -1715,9 +1754,11 @@ where
         'entries: loop {
             let (offset, info) = self.inner.next()?;
 
-            let pointer = match info.addr {
-                Addr::Initialized(pointer) => pointer,
-                Addr::Uninitialized => continue 'entries,
+            let pointer = info.addr.into_inner();
+
+            let pointer = match NonNull::new(pointer) {
+                Some(p) => p,
+                None => continue 'entries,
             };
 
             return Some(MmapEntry {
@@ -1726,10 +1767,11 @@ where
                 pointer,
 
                 // SAFETY: The following unsafe block is safe, because the MmapInfo struct is
-                // organized in a way that the address enum indicates whether nor not the struct
-                // has been initialized. Since the earlier match statement has already checked that
-                // the pointer be initialized, and thus the struct, we can assume_init here.
-                extra: unsafe { info.extra.assume_init() },
+                // organized in a way that the address indicates whether nor not the struct has
+                // been initialized (null means uninitialized). Since the earlier match statement
+                // has already checked that the pointer be non-null, and thus the struct, we can
+                // assume_init here.
+                extra: unsafe { info.extra.into_inner().assume_init() },
             });
         }
     }
@@ -1739,7 +1781,11 @@ where
 ///
 /// This trait is only currently used in the destructor of the buffer pool, after all the ranges
 /// have been validated not to be in use by an active guard.
-pub trait Handle<I, E: Copy>: Sized {
+pub trait Handle<I, E>
+where
+    E: Copy,
+    Self: Sized,
+{
     /// The possible error that may occur when freeing one or more mmap entries. This error type is
     /// forwarded to the buffer pool when this handle is used, which only currently happens in the
     /// destructor of [`BufferPool`].
@@ -1913,6 +1959,7 @@ mod tests {
             total_size += u32::try_from(len).unwrap();
 
             let _raw_slice = Box::into_raw(slice);
+
             unsafe {
                 pool.begin_expand(u32::try_from(len).unwrap())
                     .unwrap()
