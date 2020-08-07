@@ -1394,8 +1394,8 @@ where
                 // to touch the unsafe cell, provided that the pointer is null.
                 let extra = ptr::read(mmap_v.extra.get()).assume_init();
 
-                let pointer =
-                    base_pointer.add((new_offset - mmap_start).try_into_usize().unwrap()) as *mut u8;
+                let pointer = base_pointer.add((new_offset - mmap_start).try_into_usize().unwrap())
+                    as *mut u8;
 
                 (extra, pointer)
             };
