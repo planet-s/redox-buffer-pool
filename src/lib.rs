@@ -367,7 +367,12 @@ impl<I: Integer> Default for BufferPoolOptions<I> {
 
 /// A buffer pool, featuring a general-purpose 32-bit allocator, and slice guards.
 // TODO: Expand doc
-pub struct BufferPool<I: Integer, H: Handle<I, E>, E: Copy> {
+pub struct BufferPool<I, H, E>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+{
     handle: Option<H>,
 
     options: BufferPoolOptions<I>,
@@ -440,11 +445,77 @@ where
     }
 }
 
-// TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
-// exclusive, while a higher refcount would mean shared.
-#[derive(Debug)]
+/// A trait for types that are convertible by reference, into [`BufferPool`].
+///
+/// This is mainly to allow arbitrary types to be stored in smart reference-counting pointers,
+/// rather than forcing [`BufferPool`] to be the direct pointee of those pointers.
+///
+/// This trait is automatically implemented for all types that implement [`AsRef<BufferPool>`], so
+/// prefer that instead.
+pub trait AsBufferPool<I, H, E>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+{
+    /// Get a reference to the buffer pool that must be contained within the wrapper.
+    fn as_buffer_pool(&self) -> &BufferPool<I, H, E>;
+}
+
+impl<I, H, E> AsBufferPool<I, H, E> for BufferPool<I, H, E>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+{
+    fn as_buffer_pool(&self) -> &BufferPool<I, H, E> {
+        self
+    }
+}
+impl<T, I, H, E> AsBufferPool<I, H, E> for T
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    T: AsRef<BufferPool<I, H, E>>
+{
+    fn as_buffer_pool(&self) -> &BufferPool<I, H, E> {
+        self.as_ref()
+    }
+}
+
 /// A slice from the buffer pool, that can be read from or written to as a regular smart pointer.
-pub struct BufferSlice<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard = NoGuard> {
+///
+/// The buffer slice struct has one lifetime argument, `'pool`, which is only used if the buffer
+/// slice references the pool directly using a regular reference, which is the case for
+/// [`acquire_borrowed_slice`]. For slices allocated with [`acquire_strong_slice`] and
+/// [`acquire_weak_slice`], this lifetime will be `'static`.
+///
+/// Of the five generic type arguments, `I`, `H`, and `E`, are more or less inherited from the
+/// buffer pool; while only `I` (for numbers) and `E` (for the extra field) are used, they are
+/// needed since the buffer pool itself also has to be involved for some operations. The `G`
+/// parameter, is the _guard type_, which defaults to no guard at all, but allows the memory of the
+/// buffer slice to stay protected and leak the memory if the guard couldn't free it. The `C`
+/// parameter is meant for wrappers structs over [`BufferPool`], to allow [`std::sync::Arc`]s or
+/// [`std::sync::Weak`]s pointing to them instead.
+///
+/// [`acquire_borrowed_slice`]: ./struct.BufferPool.html#method.acquire_borrowed_slice
+/// [`acquire_strong_slice`]: ./struct.BufferPool.html#method.acquire_strong_slice
+/// [`acquire_weak_slice`]: ./struct.BufferPool.html#method.acquire_weak_slice
+#[derive(Debug)]
+pub struct BufferSlice<'pool, I, H, E, G = NoGuard, C = BufferPool<I, H, E>>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    //
+    // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
+    // exclusive, while a higher refcount would mean shared.
+    //
+
     alloc_start: I,
     alloc_capacity: I,
     alloc_len: I,
@@ -454,17 +525,23 @@ pub struct BufferSlice<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard = NoGu
     pointer: *mut u8,
     extra: E,
 
-    pool: PoolRefKind<'a, I, H, E>,
+    pool: PoolRefKind<'pool, I, H, E, C>,
     guard: Option<G>,
 }
 
 #[derive(Debug)]
-enum PoolRefKind<'a, I: Integer, H: Handle<I, E>, E: Copy> {
-    Ref(&'a BufferPool<I, H, E>),
-    Strong(Arc<BufferPool<I, H, E>>),
-    Weak(Weak<BufferPool<I, H, E>>),
+enum PoolRefKind<'pool, I: Integer, H: Handle<I, E>, E: Copy, C: AsBufferPool<I, H, E>> {
+    Ref(&'pool BufferPool<I, H, E>),
+    Strong(Arc<C>),
+    Weak(Weak<C>),
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy> Clone for PoolRefKind<'a, I, H, E> {
+impl<'pool, I, H, E, C> Clone for PoolRefKind<'pool, I, H, E, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    C: AsBufferPool<I, H, E>,
+{
     fn clone(&self) -> Self {
         match *self {
             Self::Ref(r) => Self::Ref(r),
@@ -474,7 +551,7 @@ impl<'a, I: Integer, H: Handle<I, E>, E: Copy> Clone for PoolRefKind<'a, I, H, E
     }
 }
 
-unsafe impl<'a, I, H, E, G> Send for BufferSlice<'a, I, H, E, G>
+unsafe impl<'pool, I, H, E, G> Send for BufferSlice<'pool, I, H, E, G>
 where
     I: Integer,
     H: Handle<I, E> + Send + Sync,
@@ -482,7 +559,7 @@ where
     G: Guard + Send,
 {
 }
-unsafe impl<'a, I, H, E, G> Sync for BufferSlice<'a, I, H, E, G>
+unsafe impl<'pool, I, H, E, G> Sync for BufferSlice<'pool, I, H, E, G>
 where
     I: Integer,
     H: Send + Sync + Handle<I, E>,
@@ -491,12 +568,13 @@ where
 {
 }
 
-impl<'a, I, H, E, G> BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> BufferSlice<'pool, I, H, E, G, C>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
     G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     /// Checks whether the pool that owns this slice is still alive, or if it has dropped. Note
     /// that this only makes sense for weak buffer slices, since buffer slices tied to a lifetime
@@ -575,12 +653,12 @@ where
 
                 let pool = match self.pool {
                     PoolRefKind::Ref(reference) => reference,
-                    PoolRefKind::Strong(ref arc) => &*arc,
+                    PoolRefKind::Strong(ref arc) => arc.as_buffer_pool(),
                     PoolRefKind::Weak(ref weak) => {
                         arc = weak.upgrade().expect(
                             "calling unguard on a weakly-owned buffer slice where the pool died",
                         );
-                        &*arc
+                        arc.as_buffer_pool()
                     }
                 };
                 let prev = pool.guarded_occ_count.fetch_sub(1, Ordering::Release);
@@ -607,12 +685,12 @@ where
 
         let pool = match self.pool {
             PoolRefKind::Ref(pool) => pool,
-            PoolRefKind::Strong(ref arc) => &*arc,
+            PoolRefKind::Strong(ref arc) => arc.as_buffer_pool(),
             PoolRefKind::Weak(ref pool_weak) => {
                 arc = pool_weak.upgrade().expect(
                     "trying to guard weakly-owned buffer slice which pool has been dropped",
                 );
-                &*arc
+                arc.as_buffer_pool()
             }
         };
         // TODO: Is Relaxed ok here?
@@ -626,7 +704,7 @@ where
     pub fn with_guard<OtherGuard: Guard>(
         self,
         other: OtherGuard,
-    ) -> Result<BufferSlice<'a, I, H, E, OtherGuard>, WithGuardError<Self>> {
+    ) -> Result<BufferSlice<'pool, I, H, E, OtherGuard, C>, WithGuardError<Self>> {
         if self.guard.is_some() {
             return Err(WithGuardError { this: self });
         }
@@ -662,14 +740,14 @@ where
             PoolRefKind::Ref(reference) => reference,
             PoolRefKind::Strong(ref aliased_arc) => {
                 arc = Arc::clone(aliased_arc);
-                &*arc
+                arc.as_buffer_pool()
             }
             PoolRefKind::Weak(ref weak) => {
                 arc = match weak.upgrade() {
                     Some(a) => a,
                     None => return true,
                 };
-                &*arc
+                arc.as_buffer_pool()
             }
         };
         let (was_guarded, can_be_reclaimed) = match self.guard {
@@ -732,12 +810,13 @@ where
         self.extra
     }
 }
-impl<'a, I, H, E, G> Drop for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> Drop for BufferSlice<'pool, I, H, E, G, C>
 where
     I: Integer,
     G: Guard,
     E: Copy,
     H: Handle<I, E>,
+    C: AsBufferPool<I, H, E>,
 {
     fn drop(&mut self) {
         match self.reclaim_inner() {
@@ -748,8 +827,13 @@ where
         }
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> ops::Deref
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> ops::Deref for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     type Target = [u8];
 
@@ -757,36 +841,61 @@ impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> ops::Deref
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> ops::DerefMut
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> ops::DerefMut for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> Borrow<[u8]>
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> Borrow<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     fn borrow(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> BorrowMut<[u8]>
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> BorrowMut<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> AsRef<[u8]>
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> AsRef<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> AsMut<[u8]>
-    for BufferSlice<'a, I, H, E, G>
+impl<'pool, I, H, E, G, C> AsMut<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
 {
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
@@ -795,12 +904,17 @@ impl<'a, I: Integer, H: Handle<I, E>, E: Copy, G: Guard> AsMut<[u8]>
 /// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
 /// method, the range has already been reserved, so it's up to this handle to initialize it.
 // TODO: Reclaim pending slice upon Drop or a fallible cancel method.
-pub struct ExpandHandle<'a, I: Integer, H: Handle<I, E>, E: Copy> {
+pub struct ExpandHandle<'pool, I, H, E>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+{
     offset: I,
     len: I,
-    pool: &'a BufferPool<I, H, E>,
+    pool: &'pool BufferPool<I, H, E>,
 }
-impl<'a, I, H, E> ExpandHandle<'a, I, H, E>
+impl<'pool, I, H, E> ExpandHandle<'pool, I, H, E>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -887,7 +1001,7 @@ impl<I> Default for AllocationStrategy<I> {
 
 type AcquireSliceRet<I, E> = (ops::Range<I>, I, ops::Range<I>, *mut u8, E);
 
-/// The result originating from [`BufferPool::close`].
+/// The result originating from [`BufferPool::try_close`].
 pub type CloseResult<I, H, E> =
     Result<(Option<H>, MmapEntries<I, E>), CloseError<BufferPool<I, H, E>>>;
 
@@ -1264,14 +1378,14 @@ where
 
         Some((offset..offset + actual_len, len, mmap_range, pointer, extra))
     }
-    fn construct_buffer_slice<G: Guard>(
+    fn construct_buffer_slice<G: Guard, C: AsBufferPool<I, H, E>>(
         alloc_range: ops::Range<I>,
         alloc_len: I,
         mmap_range: ops::Range<I>,
         pointer: *mut u8,
         extra: E,
-        pool: PoolRefKind<I, H, E>,
-    ) -> BufferSlice<'_, I, H, E, G> {
+        pool: PoolRefKind<I, H, E, C>,
+    ) -> BufferSlice<'_, I, H, E, G, C> {
         debug_assert!(alloc_len <= alloc_range.end - alloc_range.start);
 
         BufferSlice {
@@ -1317,21 +1431,25 @@ where
     /// of that.
     ///
     /// [`acquire_borrowed_slice`]: #method.acquire_borrowed_slice
-    pub fn acquire_weak_slice<G: Guard>(
-        self: &Arc<Self>,
+    pub fn acquire_weak_slice<G, C>(
+        this: &Arc<C>,
         len: I,
         alignment: I,
         strategy: AllocationStrategy<I>,
-    ) -> Option<BufferSlice<'static, I, H, E, G>> {
+    ) -> Option<BufferSlice<'static, I, H, E, G, C>>
+    where
+        G: Guard,
+        C: AsBufferPool<I, H, E>,
+    {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            self.acquire_slice(len, alignment, strategy)?;
+            this.as_buffer_pool().acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
             mmap_range,
             pointer,
             extra,
-            PoolRefKind::Weak(Arc::downgrade(self)),
+            PoolRefKind::Weak(Arc::downgrade(this)),
         ))
     }
     /// Try to acquire a strongly-borrowed ([`std::sync::Arc`]) slice, that ensures this buffer
@@ -1341,21 +1459,25 @@ where
     /// of that.
     ///
     /// [`acquire_borrowed_slice`]: #method.acquire_borrowed_slice
-    pub fn acquire_strong_slice<G: Guard>(
-        self: &Arc<Self>,
+    pub fn acquire_strong_slice<G, C>(
+        this: &Arc<C>,
         len: I,
         alignment: I,
         strategy: AllocationStrategy<I>,
-    ) -> Option<BufferSlice<'static, I, H, E, G>> {
+    ) -> Option<BufferSlice<'static, I, H, E, G, C>>
+    where
+        G: Guard,
+        C: AsBufferPool<I, H, E>,
+    {
         let (alloc_range, alloc_len, mmap_range, pointer, extra) =
-            self.acquire_slice(len, alignment, strategy)?;
+            this.as_buffer_pool().acquire_slice(len, alignment, strategy)?;
         Some(Self::construct_buffer_slice(
             alloc_range,
             alloc_len,
             mmap_range,
             pointer,
             extra,
-            PoolRefKind::Strong(Arc::clone(self)),
+            PoolRefKind::Strong(Arc::clone(this)),
         ))
     }
     fn remove_free_offset_below(
@@ -1471,7 +1593,11 @@ where
         }
     }
 
-    unsafe fn reclaim_slice_inner<G: Guard>(&self, slice: &BufferSlice<'_, I, H, E, G>) {
+    unsafe fn reclaim_slice_inner<G, C>(&self, slice: &BufferSlice<'_, I, H, E, G, C>)
+    where
+        G: Guard,
+        C: AsBufferPool<I, H, E>,
+    {
         let mut occ_write_guard = self.occ_map.write();
         let mut free_write_guard = self.free_map.write();
 
@@ -1702,8 +1828,8 @@ impl<T> fmt::Debug for ReclaimError<T> {
 #[cfg(any(test, feature = "std"))]
 impl<T> std::error::Error for ReclaimError<T> {}
 
-/// The error from [`BufferPool::close`], meaning that there is currently a guarded buffer slice in
-/// use by the pool, preventing resource freeing.
+/// The error from [`BufferPool::try_close`], meaning that there is currently a guarded buffer
+/// slice in use by the pool, preventing resource freeing.
 ///
 /// As with [`ReclaimError`], this error is convertible to `EADDRINUSE` in case the `redox` feature
 /// is enabled.
@@ -1919,8 +2045,6 @@ mod tests {
     fn alignment(strategy: AllocationStrategy<u32>) {
         let options = BufferPoolOptions::default().with_minimum_alignment(1);
         let (pool, _) = setup_pool(vec![vec![0u8; 4096]], options);
-
-        dbg!(options);
 
         fn get_and_check_slice(
             pool: &BufferPool<u32, NoHandle, ()>,
