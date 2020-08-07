@@ -372,8 +372,12 @@ pub struct BufferPool<I: Integer, H: Handle<I, E>, E: Copy> {
 
     options: BufferPoolOptions<I>,
 
-    // TODO: Concurrent B-tree
     guarded_occ_count: AtomicUsize,
+
+    //
+    // TODO: Concurrent B-trees. Well, at least something more efficient that uses less
+    // coarse-grained locks.
+    //
 
     // Occupied entries, mapped offset + used => size.
     occ_map: RwLock<BTreeMap<OccOffset<I>, Size<I>>>,
@@ -384,12 +388,18 @@ pub struct BufferPool<I: Integer, H: Handle<I, E>, E: Copy> {
     // also be io_uring "pool" shared memory or physalloc+physmap DMA allocations.
     mmap_map: RwLock<BTreeMap<Offset<I>, MmapInfo<I, E>>>,
 }
-unsafe impl<I: Integer + Send + Sync, H: Send + Handle<I, E>, E: Copy> Send
-    for BufferPool<I, H, E>
+unsafe impl<I, H, E> Send for BufferPool<I, H, E>
+where
+    I: Integer + Send,
+    H: Handle<I, E> + Send,
+    E: Copy + Send,
 {
 }
-unsafe impl<I: Integer + Send + Sync, H: Sync + Handle<I, E>, E: Copy> Sync
-    for BufferPool<I, H, E>
+unsafe impl<I, H, E> Sync for BufferPool<I, H, E>
+where
+    I: Integer + Sync,
+    H: Handle<I, E> + Sync,
+    E: Copy + Sync,
 {
 }
 
@@ -425,7 +435,7 @@ where
 {
     type Error = ::core::convert::Infallible;
 
-    fn close(self, _entries: MmapEntries<I, E>) -> Result<(), Self::Error> {
+    fn close(&mut self, _entries: MmapEntries<I, E>) -> Result<(), Self::Error> {
         unreachable!("NoHandle cannot be initialized")
     }
 }
@@ -467,9 +477,9 @@ impl<'a, I: Integer, H: Handle<I, E>, E: Copy> Clone for PoolRefKind<'a, I, H, E
 unsafe impl<'a, I, H, E, G> Send for BufferSlice<'a, I, H, E, G>
 where
     I: Integer,
-    H: Send + Sync + Handle<I, E>,
+    H: Handle<I, E> + Send + Sync,
     E: Copy + Send,
-    G: Send + Guard,
+    G: Guard + Send,
 {
 }
 unsafe impl<'a, I, H, E, G> Sync for BufferSlice<'a, I, H, E, G>
@@ -877,6 +887,10 @@ impl<I> Default for AllocationStrategy<I> {
 
 type AcquireSliceRet<I, E> = (ops::Range<I>, I, ops::Range<I>, *mut u8, E);
 
+/// The result originating from [`BufferPool::close`].
+pub type CloseResult<I, H, E> =
+    Result<(Option<H>, MmapEntries<I, E>), CloseError<BufferPool<I, H, E>>>;
+
 impl<I, H, E> BufferPool<I, H, E>
 where
     I: Integer,
@@ -959,16 +973,26 @@ where
         self.handle.as_ref()
     }
 
-    /// Close an thus free the entire pool. If there are any pending commands that have guarded
-    /// buffer slices from this pool, the entire memory will be leaked (TODO: Free as much memory
-    /// as possible when this happens, rather than the entire pool).
-    pub fn close(mut self) -> Result<Option<H>, CloseError<Self>> {
+    /// Attempt to close, and thus free each buffer slice owned by the entire pool, returning the
+    /// handle and the mmap ranges if present.
+    ///
+    /// If there are any pending commands that have guarded buffer slices from this pool, the
+    /// entire memory will be leaked, for now.
+    pub fn close(mut self) -> CloseResult<I, H, E> {
         if self.guarded_occ_count.load(Ordering::Acquire) > 0 {
+            // TODO: Free as much memory as possible when this happens, rather than the entire
+            // pool. This may add unnecessary overhead though, if a separate guard count would be
+            // stored for every mmap info entry.
             return Err(CloseError { this: self });
         }
 
         let handle = self.handle.take();
-        Ok(handle)
+        let mmap_map = mem::replace(self.mmap_map.get_mut(), BTreeMap::new());
+        let entries = MmapEntries {
+            inner: mmap_map.into_iter(),
+        };
+
+        Ok((handle, entries))
     }
     /// Create a new empty buffer pool, using an optional user "handle" that is stored together
     /// with the rest of the pool.
@@ -1054,6 +1078,11 @@ where
                 len: I,
                 alignment: I,
             ) -> Option<&FreeEntry<I>> {
+                // This is the O(n) allocation mechanism, that always finds a suitable range to
+                // use, unless the pool is full.
+                //
+                // The O(n) allocation algorithm is used when the "Optimal" allocation strategy has
+                // been specified.
                 free_map.iter().find(|e| {
                     e.size() >= len
                         && align(e.offset(), alignment)
@@ -1065,6 +1094,26 @@ where
                 len: I,
                 alignment: I,
             ) -> Option<&FreeEntry<I>> {
+                // This is the O(log n) allocation mechanism, that works in _most_ cases.
+                //
+                // Get a new entry to pop from the free space B-tree. The key Ord impl first
+                // compares the size, and then the alignment (or rather log2 of the alignment, but
+                // log2 n > log2 m implies n > m for natural numbers n,m > 1), in that order. By
+                // doing a half-open range with the start, bound, this will prioritize the smallest
+                // size and alignments, trying to reduce pool fragmentation.
+                //
+                // The alignment is directly calculated based on the number of leading binary zeroes of the
+                // offset (which is the value); in other words, it'll be the largest power of two that
+                // divides the offset.
+                //
+                // Because of that, smaller sizes will be preferred over larger sizes, but aligned
+                // ranges may however, be fewer.
+                //
+                // Note that this isn't perfect. Size+alignment doesn't work very well with B-trees
+                // (maybe a quadtree or similar for that?). Note that not adequately aligned ranges
+                // that are still large enough to account for misalignment, will still work. At the
+                // moment, the solution is to naïvely do another O(n) search, finding a suitable
+                // range. TODO: Fix that.
                 let item = free_map
                     .range(FreeEntry::from_size_offset(len, alignment)..)
                     .next()?;
@@ -1102,24 +1151,6 @@ where
             free_e.log2_of_alignment()
         );
         assert_eq!(occ_v.0, free_e.size());
-
-        // TODO: Use a better B-tree to prevent O(n) allocation, see following comments (may be
-        // incomplete or wrong).
-
-        /*
-            // Get a new entry to pop from the free space B-tree. The key Ord impl first compares the
-            // size, and then the alignment (or rather log2 of the alignment, but log2 n > log2 m
-            // implies n > m for n,m > 1), in that order. By doing a half-open range with the start,
-            // bound, this will prioritize the smallest size and alignments, reducing pool
-            // fragmentation.
-            //
-            // The alignment is directly calculated based on the number of leading binary zeroes of the
-            // offset (which is the value); in other words, it'll be the largest power of two that
-            // divides the offset.
-            //
-            // Because of that, smaller sizes will be preferred over larger sizes, but
-            let (_, v) = free_intent_guard.range(FreeKey::from_size_align(len, alignment)..)
-        */
 
         let original_off = free_e.offset();
 
@@ -1494,13 +1525,13 @@ where
         if count == 0 {
             if let Some(h) = self.handle.take() {
                 // This won't allocate, since the new mmap is entry.
-                let entries = mem::replace(&mut *self.mmap_map.write(), BTreeMap::new());
-                let _ = h.close(MmapEntries {
+                let entries = mem::replace(self.mmap_map.get_mut(), BTreeMap::new());
+                let _ = h.close_all(MmapEntries {
                     inner: entries.into_iter(),
                 });
             }
         } else {
-            log::warn!("Leaking entire buffer pool, since there were {} slices that were guarded by futures that haven't been completed", count);
+            log::warn!("Leaking parts of the buffer pool, since there were {} slices that were guarded by futures that haven't been completed", count);
         }
     }
 }
@@ -1580,26 +1611,41 @@ where
 ///
 /// This trait is only currently used in the destructor of the buffer pool, after all the ranges
 /// have been validated not to be in use by an active guard.
-pub trait Handle<I, E: Copy> {
+pub trait Handle<I, E: Copy>: Sized {
     /// The possible error that may occur when freeing one or more mmap entries. This error type is
     /// forwarded to the buffer pool when this handle is used, which only currently happens in the
     /// destructor of [`BufferPool`].
     type Error;
 
+    /// The function called when a buffer pool wants one or more ranges, proven not to contain
+    /// guarded slices, to be deallocated.
+    ///
+    /// This function is only called directly when a full close failed due to active guards, or in
+    /// the default implementation of [`close_all`].
+    ///
+    /// [`close_all`]: #method.close_all
+    fn close(&mut self, mmap_entries: MmapEntries<I, E>) -> Result<(), Self::Error>;
+
     /// The function called when a buffer pool is dropped.
     ///
     /// All the mmap ranges (originating from [`begin_expand`]) that have been initialized, are
-    /// also included here
+    /// also included here. The reason this function exists, is to allow for more performant memory
+    /// deallocation, when it is known that the buffer pool did not contain any guarded buffer slice.
     ///
-    /// This method is optional to implement; it's completely ok to simply return `Ok(())` here.
-    fn close(self, mmap_entries: MmapEntries<I, E>) -> Result<(), Self::Error>;
+    /// An implementor might for example, close the file descriptor rather than repeatedly calling
+    /// _munmap(2)_, if _mmap(2)_ is used internally.
+    ///
+    /// [`begin_expand`]: ./struct.BufferPool.html#method.begin_expand
+    fn close_all(mut self, mmap_entries: MmapEntries<I, E>) -> Result<(), Self::Error> {
+        self.close(mmap_entries)
+    }
 }
 /// The requirement of a guard to a slice. Guards can optionally prevent slices from being
 /// reclaimed; the slices have a fallible [`BufferSlice::reclaim`] method, but their `Drop` impl
 /// will cause the memory to leak if it's still protected by the guard. This is especially useful
 /// when the buffers are shared with another process (`io_uring` for instance), or by hardware,
 /// since this prevents data races that could occur, if a new buffer for a different purpose
-/// happens to use the same memory as an old buffer that hardware e.g. thinks it can write to.
+/// happens to use the same memory as an old buffer that e.g. hardware thinks it can write to.
 pub trait Guard {
     /// Try to release the guard, returning either true for success or false for failure.
     fn try_release(&self) -> bool;
@@ -1659,6 +1705,7 @@ impl<T> std::error::Error for ReclaimError<T> {}
 ///
 /// As with [`ReclaimError`], this error is convertible to `EADDRINUSE` in case the `redox` feature
 /// is enabled.
+#[derive(Debug)]
 pub struct CloseError<T> {
     /// The buffer pool that couldn't be destroyed.
     pub this: T,
@@ -1666,13 +1713,6 @@ pub struct CloseError<T> {
 impl<T> fmt::Display for CloseError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to close since buffers were in use")
-    }
-}
-impl<T> fmt::Debug for CloseError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloseError")
-            // TODO
-            .finish()
     }
 }
 /// The error internally caused by arithmetic overflow, that indicates the buffer pool has no more
