@@ -1218,7 +1218,9 @@ where
                 return None;
             }
 
-            let advancement = at.checked_sub(base_occ_k.offset()).expect("expected the preceding free entry to actually come before the fixed offset");
+            let advancement = at.checked_sub(base_occ_k.offset()).expect(
+                "expected the preceding free entry to actually come before the fixed offset",
+            );
 
             let available_size = base_occ_v.size().checked_sub(advancement)?;
 
@@ -1227,7 +1229,10 @@ where
             }
 
             let free_e = free_intent_guard
-                .get(&FreeEntry::from_size_offset(base_occ_v.0, base_occ_k.offset()))
+                .get(&FreeEntry::from_size_offset(
+                    base_occ_v.0,
+                    base_occ_k.offset(),
+                ))
                 .expect("expected occ map to contain a corresponding entry for the free entry");
 
             (base_occ_k, base_occ_v, *free_e, advancement)
@@ -1320,7 +1325,13 @@ where
         let misalignment = aligned_off - advanced_off;
         let new_offset = aligned_off;
 
-        assert!(new_offset < free_e.offset() + free_e.size(), "assertion failed: {} < {} + {}", new_offset, free_e.offset(), free_e.size());
+        assert!(
+            new_offset < free_e.offset() + free_e.size(),
+            "assertion failed: {} < {} + {}",
+            new_offset,
+            free_e.offset(),
+            free_e.size()
+        );
 
         let total_advancement = misalignment.checked_add(advancement)?;
 
@@ -1569,8 +1580,7 @@ where
         // the input range.
         let range = ..partial_k;
 
-        if let Some((lower_occ_k, lower_occ_v)) = occ_map.range(range).next_back()
-        {
+        if let Some((lower_occ_k, lower_occ_v)) = occ_map.range(range).next_back() {
             let lower_occ_k = *lower_occ_k;
             let lower_occ_v = *lower_occ_v;
 
@@ -2169,15 +2179,23 @@ mod tests {
         const N: usize = 1000;
 
         for _ in 0..N {
-            let alignment = 1;//1 << thread_rng.gen_range(0, 3);
+            let alignment = 1 << thread_rng.gen_range(0, 3);
             let unaligned_offset = thread_rng.gen_range(0, 2048 - alignment);
             let offset = (unaligned_offset + alignment - 1) / alignment * alignment;
 
             let len = thread_rng.gen_range(0, 2048 - offset);
 
-            if len == 0 { continue }
+            if len == 0 {
+                continue;
+            }
 
-            let slice = pool.acquire_borrowed_slice::<NoGuard>(len, alignment, AllocationStrategy::Fixed(offset)).unwrap();
+            let slice = pool
+                .acquire_borrowed_slice::<NoGuard>(
+                    len,
+                    alignment,
+                    AllocationStrategy::Fixed(offset),
+                )
+                .unwrap();
             assert_eq!(slice.offset(), offset);
             assert_eq!(slice.len(), len);
             assert_eq!(slice.offset() % alignment, 0);
