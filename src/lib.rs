@@ -56,6 +56,7 @@ mod private {
         + ops::Add<Self, Output = Self>
         + ops::AddAssign
         + ops::Sub<Self, Output = Self>
+        + ops::Rem<Output = Self>
         + ops::Shl<u8, Output = Self>
         + ops::Shl<u32, Output = Self>
         + ops::Shr<u8, Output = Self>
@@ -200,8 +201,17 @@ impl<I: Integer> PartialOrd<Self> for FreeEntry<I> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct OccOffset<I>(I);
+
+impl<I: Integer> fmt::Debug for OccOffset<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccOffset")
+            .field("offset", &self.offset())
+            .field("is_used", &self.is_used())
+            .finish()
+    }
+}
 
 impl<I: Integer> OccOffset<I> {
     fn offset(&self) -> I {
@@ -352,6 +362,7 @@ impl<I: Integer> Default for BufferPoolOptions<I> {
 
 /// A buffer pool, featuring a general-purpose 32-bit allocator, and slice guards.
 // TODO: Expand doc
+#[derive(Debug)]
 pub struct BufferPool<I, H, E>
 where
     I: Integer,
@@ -395,22 +406,10 @@ where
 {
 }
 
-impl<I, H, E> fmt::Debug for BufferPool<I, H, E>
-where
-    I: Integer,
-    H: fmt::Debug + Handle<I, E>,
-    E: Copy,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BufferPool")
-            .field("handle", &self.handle)
-            // TODO: maps
-            .finish()
-    }
-}
-
 /// A no-op guard, that cannot be initialized but still useful in type contexts..
+#[derive(Debug)]
 pub enum NoGuard {}
+
 impl Guard for NoGuard {
     fn try_release(&self) -> bool {
         unreachable!("NoGuard cannot be initialized")
@@ -419,6 +418,7 @@ impl Guard for NoGuard {
 
 /// A handle type that cannot be initialized, causing the handle to take up no space in the buffer
 /// pool struct.
+#[derive(Debug)]
 pub enum NoHandle {}
 
 impl<I, E> Handle<I, E> for NoHandle
@@ -1201,20 +1201,36 @@ where
                 .checked_mul(alignment)
         }
 
-        let (occ_k, occ_v, free_e) = if let AllocationStrategy::Fixed(at) = strategy {
-            let (occ_k, occ_v) = occ_intent_guard
+        let (occ_k, occ_v, free_e, advancement) = if let AllocationStrategy::Fixed(at) = strategy {
+            assert_eq!(at % alignment, I::zero());
+
+            // NOTE: This "search" is merely for checking that there is a free range, and that it's
+            // large enough. Fixed allocations will always be placed exactly where they are told
+            // to.
+            let (base_occ_k, base_occ_v) = occ_intent_guard
                 .range(..=OccOffset::from_offset_used(at, false))
                 .next_back()?;
 
-            if occ_v.size() < len {
+            if base_occ_k.is_used() {
+                return None;
+            }
+            if base_occ_k.offset() + base_occ_v.size() < at {
+                return None;
+            }
+
+            let advancement = at.checked_sub(base_occ_k.offset()).expect("expected the preceding free entry to actually come before the fixed offset");
+
+            let available_size = base_occ_v.size().checked_sub(advancement)?;
+
+            if available_size < len {
                 return None;
             }
 
             let free_e = free_intent_guard
-                .get(&FreeEntry::from_size_offset(occ_v.0, occ_k.offset()))
+                .get(&FreeEntry::from_size_offset(base_occ_v.0, base_occ_k.offset()))
                 .expect("expected occ map to contain a corresponding entry for the free entry");
 
-            (occ_k, occ_v, *free_e)
+            (base_occ_k, base_occ_v, *free_e, advancement)
         } else {
             fn find_o_n<I: Integer>(
                 free_map: &BTreeSet<FreeEntry<I>>,
@@ -1284,7 +1300,7 @@ where
                 .get_key_value(&OccOffset::from_offset_used(free_e.offset(), false))
                 .expect("expected free map to contain a corresponding entry for the occ entry");
 
-            (occ_k, occ_v, *free_e)
+            (occ_k, occ_v, *free_e, I::zero())
         };
 
         assert!(!occ_k.is_used());
@@ -1296,11 +1312,17 @@ where
         assert_eq!(occ_v.0, free_e.size());
 
         let original_off = free_e.offset();
+        let advanced_off = original_off.checked_add(advancement)?;
 
         let aligned_off =
-            align(original_off, alignment).expect("bypassed alignment check in iterator");
-        assert!(aligned_off < free_e.offset() + free_e.size());
-        let align_advancement = aligned_off - free_e.offset();
+            align(advanced_off, alignment).expect("bypassed alignment check in iterator");
+
+        let misalignment = aligned_off - advanced_off;
+        let new_offset = aligned_off;
+
+        assert!(new_offset < free_e.offset() + free_e.size(), "assertion failed: {} < {} + {}", new_offset, free_e.offset(), free_e.size());
+
+        let total_advancement = misalignment.checked_add(advancement)?;
 
         let new_offset = {
             let mut occ_write_guard = RwLockUpgradableReadGuard::upgrade(occ_intent_guard);
@@ -1309,14 +1331,17 @@ where
             let had_prev = free_write_guard.remove(&free_e);
             assert!(had_prev);
 
+            // TODO: Shrink the length in-place rather than removing and then inserting twice, if
+            // space is needed for misalignment.
+
             let prev = occ_write_guard.remove(&OccOffset::from_offset_used(original_off, false));
             assert!(prev.is_some());
 
-            if free_e.size() > len {
+            if free_e.size() - total_advancement > len {
                 let mut upper_free_e = free_e;
                 // Reinsert the upper part of the free range, if the entire range wasn't used.
-                upper_free_e.set_size(upper_free_e.size() - len);
-                upper_free_e.set_offset(upper_free_e.offset() + len);
+                upper_free_e.set_size(free_e.size() - len - total_advancement);
+                upper_free_e.set_offset(free_e.offset() + len + total_advancement);
 
                 let updated = free_write_guard.insert(upper_free_e);
                 assert!(updated);
@@ -1327,10 +1352,10 @@ where
                 );
                 assert_eq!(prev, None);
             }
-            if align_advancement > I::zero() {
+            if total_advancement > I::zero() {
                 // If there was unused space due to alignment, insert that small region marked
                 // unused as well.
-                let new_free_e = FreeEntry::from_size_offset(align_advancement, original_off);
+                let new_free_e = FreeEntry::from_size_offset(total_advancement, original_off);
 
                 let updated = free_write_guard.insert(new_free_e);
                 assert!(
@@ -1404,7 +1429,8 @@ where
 
         let offset = aligned_off;
 
-        // TODO
+        // TODO: Round up the length, to align the offset above to the minimum offset (or
+        // speculatively, based on how the allocator would benefit from that).
         let actual_len = len;
 
         Some((offset..offset + actual_len, len, mmap_range, pointer, extra))
@@ -1524,10 +1550,6 @@ where
         size: &mut I,
     ) -> bool {
         let previous_start = *start;
-        let lower_offset = match previous_start.checked_sub(I::from(1u8)) {
-            Some(l) => l,
-            None => return false,
-        };
 
         let (cur_mmap_k, cur_mmap_v) = mmap_map
             .range(..=Offset(previous_start))
@@ -1537,14 +1559,17 @@ where
         assert!(cur_mmap_k.0 + cur_mmap_v.size.0 > previous_start);
         assert!(cur_mmap_k.0 <= previous_start);
 
-        // We can't merge free entries faster than O(n), because the obviously have to be coninuous
-        // for that to work, and they are only laid out based on size and alignment. What we can do
-        // though, is to merge the occ map entries if possible, and then indirectly merging the
-        // free entries.
+        // We can't merge free entries faster than O(n), because they have to be coninuous for that
+        // to work, and they are only laid out based on size and alignment. What we can do though,
+        // is to merge the occ map entries if possible, and then indirectly merging the free
+        // entries.
 
-        let lower_occ_partial_k = OccOffset::from_offset_used(lower_offset, false);
+        let partial_k = OccOffset::from_offset_used(previous_start, false);
+        // Note that this range excludes the last element; therefore, we only allow ranges _below_
+        // the input range.
+        let range = ..partial_k;
 
-        if let Some((lower_occ_k, lower_occ_v)) = occ_map.range(..=lower_occ_partial_k).next_back()
+        if let Some((lower_occ_k, lower_occ_v)) = occ_map.range(range).next_back()
         {
             let lower_occ_k = *lower_occ_k;
             let lower_occ_v = *lower_occ_v;
@@ -1594,20 +1619,18 @@ where
         start: &mut I,
         size: &mut I,
     ) -> bool {
-        if *size == I::from(0u8) {
-            return false;
-        }
+        assert_ne!(*size, I::zero());
 
         let end = *start + *size;
 
         let higher_occ_k = OccOffset::from_offset_used(end, false);
 
-        let (cur_mmap_k, cur_mmap_v) = mmap_map.range(..=Offset(*start)).next_back().unwrap();
+        let (cur_mmap_k, cur_mmap_v) = mmap_map.range(..=Offset(end)).next_back().unwrap();
 
-        assert!(cur_mmap_k.0 + cur_mmap_v.size.0 > *start);
-        assert!(cur_mmap_k.0 <= *start);
+        assert!(cur_mmap_k.0 + cur_mmap_v.size.0 >= end);
+        assert!(cur_mmap_k.0 <= end);
 
-        if cur_mmap_k.0 + cur_mmap_v.size.0 == *start {
+        if cur_mmap_k.0 + cur_mmap_v.size.0 == end {
             // The mmap range ended at the current offset, which makes it impossible to merge the
             // above offset into a single region, since all occupiable ranges must be continuous.
             return false;
@@ -2132,5 +2155,34 @@ mod tests {
         assert_eq!(entry.size(), 4);
         assert_eq!(entry.offset(), 3);
         assert_eq!(entry.log2_of_alignment(), 0);
+    }
+
+    #[test]
+    fn fixed_allocations() {
+        use rand::Rng;
+
+        let options = BufferPoolOptions::new().with_minimum_alignment(1);
+        let (pool, _) = setup_pool(vec![vec![0u8; 4096]], options);
+
+        let mut thread_rng = rand::thread_rng();
+
+        const N: usize = 1000;
+
+        for _ in 0..N {
+            let alignment = 1;//1 << thread_rng.gen_range(0, 3);
+            let unaligned_offset = thread_rng.gen_range(0, 2048 - alignment);
+            let offset = (unaligned_offset + alignment - 1) / alignment * alignment;
+
+            let len = thread_rng.gen_range(0, 2048 - offset);
+
+            if len == 0 { continue }
+
+            let slice = pool.acquire_borrowed_slice::<NoGuard>(len, alignment, AllocationStrategy::Fixed(offset)).unwrap();
+            assert_eq!(slice.offset(), offset);
+            assert_eq!(slice.len(), len);
+            assert_eq!(slice.offset() % alignment, 0);
+            assert_eq!(slice.mmap_offset(), 0);
+            assert_eq!(slice.mmap_size(), 4096);
+        }
     }
 }
