@@ -37,6 +37,8 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 #[cfg(not(any(test, feature = "std")))]
 use spinning::{RwLock, RwLockUpgradableReadGuard};
 
+pub use guard_trait::{Guardable, Guard, NoGuard};
+
 mod private {
     use core::{fmt, ops};
 
@@ -404,16 +406,6 @@ where
     H: Handle<I, E> + Sync,
     E: Copy + Sync,
 {
-}
-
-/// A no-op guard, that cannot be initialized but still useful in type contexts..
-#[derive(Debug)]
-pub enum NoGuard {}
-
-impl Guard for NoGuard {
-    fn try_release(&self) -> bool {
-        unreachable!("NoGuard cannot be initialized")
-    }
 }
 
 /// A handle type that cannot be initialized, causing the handle to take up no space in the buffer
@@ -1664,8 +1656,8 @@ where
 
     unsafe fn reclaim_slice_inner<G, C>(&self, slice: &BufferSlice<'_, I, H, E, G, C>)
     where
-        G: Guard,
         C: AsBufferPool<I, H, E>,
+        G: Guard,
     {
         let mut occ_write_guard = self.occ_map.write();
         let mut free_write_guard = self.free_map.write();
@@ -1774,7 +1766,7 @@ pub struct MmapEntry<I, E> {
     /// [`size`]: #structfield.size
     pub pointer: NonNull<u8>,
 
-    /// The extra field that was also supplied to [`Expansion::initialize`].
+    /// The extra field that was also supplied to [`ExpansionHandle::initialize`].
     pub extra: E,
 }
 impl<I, E> Iterator for MmapEntries<I, E>
@@ -1846,16 +1838,6 @@ where
     fn close_all(mut self, mmap_entries: MmapEntries<I, E>) -> Result<(), Self::Error> {
         self.close(mmap_entries)
     }
-}
-/// The requirement of a guard to a slice. Guards can optionally prevent slices from being
-/// reclaimed; the slices have a fallible [`BufferSlice::reclaim`] method, but their `Drop` impl
-/// will cause the memory to leak if it's still protected by the guard. This is especially useful
-/// when the buffers are shared with another process (`io_uring` for instance), or by hardware,
-/// since this prevents data races that could occur, if a new buffer for a different purpose
-/// happens to use the same memory as an old buffer that e.g. hardware thinks it can write to.
-pub trait Guard {
-    /// Try to release the guard, returning either true for success or false for failure.
-    fn try_release(&self) -> bool;
 }
 
 /// The potential error from [`BufferSlice::with_guard`] or [`BufferSlice::guard`], indicating that
@@ -1966,6 +1948,41 @@ mod libc_error_impls {
     impl<T> From<WithGuardError<T>> for Error {
         fn from(_: WithGuardError<T>) -> Error {
             Error::new(EEXIST)
+        }
+    }
+}
+
+unsafe impl<'pool, I, E, G, H, C> Guardable<G> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    fn try_guard(&mut self, guard: G) -> Result<(), G> {
+        // TODO: Add something like try_release to the public API of redox-buffer-pool.
+
+        match self.guard(guard) {
+            Ok(()) => Ok(()),
+            Err(WithGuardError { this: new_guard }) => unsafe {
+                let existing_guard = self.unguard().expect(
+                    "expected a BufferSlice not to contain a guard, if the guard method failed",
+                );
+
+                if existing_guard.try_release() {
+                    self.guard(new_guard).expect(
+                        "expected no guard to exist in BufferSlice, if it just was released",
+                    );
+
+                    Ok(())
+                } else {
+                    self.guard(existing_guard).expect(
+                        "expected no guard to exist in BufferSlice, if it just was released",
+                    );
+                    Err(new_guard)
+                }
+            },
         }
     }
 }
