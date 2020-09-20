@@ -37,7 +37,7 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 #[cfg(not(any(test, feature = "std")))]
 use spinning::{RwLock, RwLockUpgradableReadGuard};
 
-pub use guard_trait::{Guardable, Guard, NoGuard};
+pub use guard_trait::{Guardable, GuardableExclusive, Guard, NoGuard};
 
 mod private {
     use core::{fmt, ops};
@@ -729,7 +729,7 @@ where
             }
         };
         let (was_guarded, can_be_reclaimed) = match self.guard {
-            Some(ref guard) => (true, guard.try_release()),
+            Some(ref mut guard) => (true, guard.try_release()),
             None => (false, true),
         };
         if can_be_reclaimed {
@@ -786,6 +786,10 @@ where
     /// Get the extra field from the mmap region this slice belongs to, copied.
     pub fn extra(&self) -> E {
         self.extra
+    }
+    /// Check whether there exists a guard protecting the memory.
+    pub fn has_guard(&self) -> bool {
+        self.guard.is_some()
     }
 }
 impl<'pool, I, H, E, G, C> Drop for BufferSlice<'pool, I, H, E, G, C>
@@ -1952,7 +1956,7 @@ mod libc_error_impls {
     }
 }
 
-unsafe impl<'pool, I, E, G, H, C> Guardable<G> for BufferSlice<'pool, I, H, E, G, C>
+unsafe impl<'pool, I, E, G, H, C> Guardable<G, [u8]> for BufferSlice<'pool, I, H, E, G, C>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -1966,7 +1970,7 @@ where
         match self.guard(guard) {
             Ok(()) => Ok(()),
             Err(WithGuardError { this: new_guard }) => unsafe {
-                let existing_guard = self.unguard().expect(
+                let mut existing_guard = self.unguard().expect(
                     "expected a BufferSlice not to contain a guard, if the guard method failed",
                 );
 
@@ -1984,6 +1988,27 @@ where
                 }
             },
         }
+    }
+    fn try_get_data(&self) -> Option<&[u8]> {
+        if self.has_guard() {
+            return None;
+        }
+        Some(self.as_ref())
+    }
+}
+unsafe impl<'pool, I, E, G, H, C> GuardableExclusive<G, [u8]> for BufferSlice<'pool, I, H, E, G, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    fn try_get_data_mut(&mut self) -> Option<&mut [u8]> {
+        if self.has_guard() {
+            return None;
+        }
+        Some(self.as_mut())
     }
 }
 
