@@ -21,6 +21,7 @@
 use core::borrow::{Borrow, BorrowMut};
 use core::cell::UnsafeCell;
 use core::convert::{TryFrom, TryInto};
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -37,7 +38,7 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 #[cfg(not(any(test, feature = "std")))]
 use spinning::{RwLock, RwLockUpgradableReadGuard};
 
-pub use guard_trait::{Guardable, GuardableExclusive, Guard, NoGuard};
+pub use guard_trait::{Guard, Guardable, GuardableExclusive, GuardableShared, NoGuard};
 
 mod private {
     use core::{fmt, ops};
@@ -478,12 +479,27 @@ where
 /// parameter is meant for wrappers structs over [`BufferPool`], to allow [`std::sync::Arc`]s or
 /// [`std::sync::Weak`]s pointing to them instead.
 ///
+/// The `M` generic parameter is used for the "guarding mode", an must implement the
+/// [`guard_trait::marker::Mode`] trait. It has no effect whatsoever on the data, but controls what
+/// can and what cannot be done in safe code, with respect to the guard. The exclusive mode will
+/// limit the ability to access the memory mutably or immutably, while the guard is present, while
+/// the shared mode will only forbid mutable access, while the guard is active, but always allow
+/// immutable access. Buffer slices can be converted to and from these types, though converting
+/// from shared into exclusive requires proof that there is no aliasing going on.
+///
 /// [`acquire_borrowed_slice`]: ./struct.BufferPool.html#method.acquire_borrowed_slice
 /// [`acquire_strong_slice`]: ./struct.BufferPool.html#method.acquire_strong_slice
 /// [`acquire_weak_slice`]: ./struct.BufferPool.html#method.acquire_weak_slice
 #[derive(Debug)]
-pub struct BufferSlice<'pool, I, H, E, G = NoGuard, C = BufferPool<I, H, E>>
-where
+pub struct BufferSlice<
+    'pool,
+    I,
+    H,
+    E,
+    G = NoGuard,
+    C = BufferPool<I, H, E>,
+    M: guard_trait::marker::Mode = guard_trait::marker::Exclusive,
+> where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
@@ -493,6 +509,7 @@ where
     //
     // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
     // exclusive, while a higher refcount would mean shared.
+    // TODO: What about the mode generic parameter?
     //
     alloc_start: I,
     alloc_capacity: I,
@@ -505,6 +522,8 @@ where
 
     pool: PoolRefKind<'pool, I, H, E, C>,
     guard: Option<G>,
+
+    _marker: PhantomData<M>,
 }
 
 #[derive(Debug)]
@@ -529,30 +548,36 @@ where
     }
 }
 
-unsafe impl<'pool, I, H, E, G> Send for BufferSlice<'pool, I, H, E, G>
+unsafe impl<'pool, I, H, E, G, C, M> Send for BufferSlice<'pool, I, H, E, G, C, M>
 where
     I: Integer,
     H: Handle<I, E> + Send + Sync,
     E: Copy + Send,
     G: Guard + Send,
+    C: AsBufferPool<I, H, E>,
+    M: guard_trait::marker::Mode,
 {
 }
-unsafe impl<'pool, I, H, E, G> Sync for BufferSlice<'pool, I, H, E, G>
+unsafe impl<'pool, I, H, E, G, C, M> Sync for BufferSlice<'pool, I, H, E, G, C, M>
 where
     I: Integer,
     H: Send + Sync + Handle<I, E>,
     E: Copy + Sync,
     G: Sync + Guard,
+    C: AsBufferPool<I, H, E>,
+    M: guard_trait::marker::Mode,
 {
 }
+// TODO: Unpin, UnwindSafe, RefUnwindSafe
 
-impl<'pool, I, H, E, G, C> BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, G, C, M> BufferSlice<'pool, I, H, E, G, C, M>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
     G: Guard,
     C: AsBufferPool<I, H, E>,
+    M: guard_trait::marker::Mode,
 {
     /// Checks whether the pool that owns this slice is still alive, or if it has dropped. Note
     /// that this only makes sense for weak buffer slices, since buffer slices tied to a lifetime
@@ -568,63 +593,89 @@ where
         }
     }
 
-    /// Construct an immutable slice from this buffer.
+    /// Constructs an immutable slice from this buffer, provided that there is no guard protecting
+    /// the memory
     ///
     /// # Panics
     ///
-    /// This method will panic if this is a weak slice, and the buffer pool has been destroyed..
-    pub fn as_slice(&self) -> &[u8] {
-        assert!(self.pool_is_alive());
+    /// This method uses _debug assertions_ to verify that the pool has not been dropped, and that
+    /// there is no guard in case `M` is `Exclusive`.
+    ///
+    /// # Safety
+    ///
+    /// For this to be safe, the caller _must_ ensure that the pool has not been dropped (which is
+    /// only possible when weakly referenced), and that there is no existing guard while `M` is
+    /// `Exclusive`.
+    pub unsafe fn as_slice_unchecked(&self) -> &[u8] {
+        debug_assert!(self.pool_is_alive());
+        debug_assert!(M::IS_ALIASABLE || !self.has_guard());
         debug_assert!(self.alloc_capacity >= self.alloc_len);
-        unsafe {
-            slice::from_raw_parts(
-                self.pointer as *const u8,
-                self.alloc_len
-                    .try_into_usize()
-                    .expect("the buffer pool integer type is too large to fit within the system pointer width"),
-            )
-        }
+
+        slice::from_raw_parts(
+            self.pointer as *const u8,
+            self.alloc_len.try_into_usize().expect(
+                "the buffer pool integer type is too large to fit within the system pointer width",
+            ),
+        )
     }
     /// Tries to construct an immutable slice from this buffer, returning None if the pool has been
-    /// dropped (and hence, this is a weak slice).
+    /// dropped (and hence, this is a weak slice), or if there is a guard and the mode is exclusive.
     pub fn try_as_slice(&self) -> Option<&[u8]> {
-        if self.pool_is_alive() {
-            Some(self.as_slice())
-        } else {
-            None
+        if !self.pool_is_alive() {
+            return None;
         }
+        if !M::IS_ALIASABLE && self.has_guard() {
+            return None;
+        }
+        Some(unsafe { self.as_slice_unchecked() })
     }
     /// Construct a mutable slice from this buffer.
     ///
     /// # Panics
     ///
-    /// Like [`as_slice`], this method will panic if the buffer pool has been destroyed.
+    /// This method uses _debug assertions_ to verify that the pool is alive, and that a guard is
+    /// not present.
+    ///
+    /// # Safety
+    ///
+    /// For this to be safe, the caller _must_ ensure that the pool has not been dropped (which is
+    /// only possible when weakly referenced), and that there is no existing guard at all.
     ///
     /// [`as_slice`]: #method.as_slice
-    pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        assert!(self.pool_is_alive());
+    pub unsafe fn as_slice_mut_unchecked(&mut self) -> &mut [u8] {
+        debug_assert!(self.pool_is_alive());
         debug_assert!(self.alloc_capacity >= self.alloc_len);
-        unsafe {
-            slice::from_raw_parts_mut(self.pointer, self.alloc_len.try_into_usize().expect("the buffer pool integer type is too large to fit within the system pointer width"))
-        }
+        debug_assert!(!self.has_guard());
+
+        slice::from_raw_parts_mut(
+            self.pointer,
+            self.alloc_len.try_into_usize().expect(
+                "the buffer pool integer type is too large to fit within the system pointer width",
+            ),
+        )
     }
     /// Tries to construct a mutable slice from this buffer, returning None if the pool has been
-    /// destroyed.
+    /// destroyed, or if there is an existing guard.
     pub fn try_as_slice_mut(&mut self) -> Option<&mut [u8]> {
-        if self.pool_is_alive() {
-            Some(self.as_slice_mut())
-        } else {
-            None
+        if !self.pool_is_alive() {
+            return None;
         }
+        if !M::IS_ALIASABLE && self.has_guard() {
+            return None;
+        }
+
+        Some(unsafe { self.as_slice_mut_unchecked() })
     }
     /// Forcefully remove a guard from a future, from this slice, returning it if there was a guard
     /// already.
     ///
     /// # Safety
+    ///
     /// This is unsafe because it allows removing guards set by pending futures; although this is
     /// completely fine when there are no pending ones, the buffer slice will be reclaimed without
-    /// the guard, causing UB if any producer keeps using its pointer.
-    pub unsafe fn unguard(&mut self) -> Option<G> {
+    /// the guard, causing UB if any producer keeps using its pointer. Also, exclusive slices may
+    /// be able to mutably alias if code relies on that being upheld.
+    pub unsafe fn unguard_unchecked(&mut self) -> Option<G> {
         match self.guard.take() {
             Some(g) => {
                 let arc;
@@ -682,8 +733,8 @@ where
     pub fn with_guard<OtherGuard: Guard>(
         self,
         other: OtherGuard,
-    ) -> Result<BufferSlice<'pool, I, H, E, OtherGuard, C>, WithGuardError<Self>> {
-        if self.guard.is_some() {
+    ) -> WithGuardResult<'pool, I, H, E, G, OtherGuard, C, M> {
+        if self.has_guard() {
             return Err(WithGuardError { this: self });
         }
         let alloc_start = self.alloc_start;
@@ -707,6 +758,7 @@ where
             pool,
             extra,
             guard: None,
+            _marker: PhantomData::<M>,
         };
         slice.guard(other).unwrap();
         Ok(slice)
@@ -735,7 +787,7 @@ where
         if can_be_reclaimed {
             unsafe {
                 if was_guarded {
-                    self.unguard().unwrap();
+                    self.unguard_unchecked().unwrap();
                 }
                 pool.reclaim_slice_inner(&*self);
             }
@@ -792,13 +844,52 @@ where
         self.guard.is_some()
     }
 }
-impl<'pool, I, H, E, G, C> Drop for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, G, C> BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Shared>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    /// Get a slice from the buffer chunk.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        assert!(self.pool_is_alive());
+        unsafe { self.as_slice_unchecked() }
+    }
+}
+impl<'pool, I, H, E, C> BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    C: AsBufferPool<I, H, E>,
+{
+    /// Get a slice from the buffer chunk, provided that the cannot exist any guard.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        assert!(self.pool_is_alive());
+        unsafe { self.as_slice_unchecked() }
+    }
+    /// Get a mutable slice from from the buffer chunk. This requires that there cannot be any
+    /// guard; otherwise, use [`try_as_slice_mut`].
+    ///
+    /// [`try_as_slice_mut`]: #method.try_as_slice_mut
+    #[inline]
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        assert!(self.pool_is_alive());
+        unsafe { self.as_slice_mut_unchecked() }
+    }
+}
+impl<'pool, I, H, E, G, C, M> Drop for BufferSlice<'pool, I, H, E, G, C, M>
 where
     I: Integer,
     G: Guard,
     E: Copy,
     H: Handle<I, E>,
     C: AsBufferPool<I, H, E>,
+    M: guard_trait::marker::Mode,
 {
     fn drop(&mut self) {
         match self.reclaim_inner() {
@@ -809,7 +900,8 @@ where
         }
     }
 }
-impl<'pool, I, H, E, G, C> ops::Deref for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, G, C> ops::Deref
+    for BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Shared>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -823,19 +915,34 @@ where
         self.as_slice()
     }
 }
-impl<'pool, I, H, E, G, C> ops::DerefMut for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, C> ops::Deref
+    for BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+impl<'pool, I, H, E, C> ops::DerefMut
+    for BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
     C: AsBufferPool<I, H, E>,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
-impl<'pool, I, H, E, G, C> Borrow<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, G, C> Borrow<[u8]>
+    for BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Shared>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -847,19 +954,31 @@ where
         self.as_slice()
     }
 }
-impl<'pool, I, H, E, G, C> BorrowMut<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, C> Borrow<[u8]>
+    for BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl<'pool, I, H, E, C> BorrowMut<[u8]> for BufferSlice<'pool, I, H, E, NoGuard, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
     C: AsBufferPool<I, H, E>,
 {
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
     }
 }
-impl<'pool, I, H, E, G, C> AsRef<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, G, C> AsRef<[u8]>
+    for BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Shared>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -871,12 +990,24 @@ where
         self.as_slice()
     }
 }
-impl<'pool, I, H, E, G, C> AsMut<[u8]> for BufferSlice<'pool, I, H, E, G, C>
+impl<'pool, I, H, E, C> AsRef<[u8]>
+    for BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl<'pool, I, H, E, C> AsMut<[u8]>
+    for BufferSlice<'pool, I, H, E, NoGuard, C, guard_trait::marker::Exclusive>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
     C: AsBufferPool<I, H, E>,
 {
     fn as_mut(&mut self) -> &mut [u8] {
@@ -885,7 +1016,6 @@ where
 }
 /// A handle for expansion. When this handle is retrieved by the [`BufferPool::begin_expand`]
 /// method, the range has already been reserved, so it's up to this handle to initialize it.
-// TODO: Reclaim pending slice upon Drop or a fallible cancel method.
 pub struct ExpansionHandle<'pool, I, H, E>
 where
     I: Integer,
@@ -1018,6 +1148,12 @@ type AcquireSliceRet<I, E> = (ops::Range<I>, I, ops::Range<I>, *mut u8, E);
 /// The result originating from [`BufferPool::try_close`].
 pub type CloseResult<I, H, E> =
     Result<(Option<H>, MmapEntries<I, E>), CloseError<BufferPool<I, H, E>>>;
+
+/// The result originating from [`BufferSlice::with_guard`].
+pub type WithGuardResult<'pool, I, H, E, OldGuard, NewGuard, C, M> = Result<
+    BufferSlice<'pool, I, H, E, NewGuard, C, M>,
+    WithGuardError<BufferSlice<'pool, I, H, E, OldGuard, C, M>>,
+>;
 
 impl<I, H, E> BufferPool<I, H, E>
 where
@@ -1463,6 +1599,7 @@ where
             pool,
             extra,
             guard: None,
+            _marker: PhantomData,
         }
     }
     /// Try to acquire a statically (as in compiler-checked and lifetime-tied) borrowed slice, from
@@ -1658,10 +1795,11 @@ where
         }
     }
 
-    unsafe fn reclaim_slice_inner<G, C>(&self, slice: &BufferSlice<'_, I, H, E, G, C>)
+    unsafe fn reclaim_slice_inner<G, C, M>(&self, slice: &BufferSlice<'_, I, H, E, G, C, M>)
     where
         C: AsBufferPool<I, H, E>,
         G: Guard,
+        M: guard_trait::marker::Mode,
     {
         let mut occ_write_guard = self.occ_map.write();
         let mut free_write_guard = self.free_map.write();
@@ -1956,13 +2094,14 @@ mod libc_error_impls {
     }
 }
 
-unsafe impl<'pool, I, E, G, H, C> Guardable<G, [u8]> for BufferSlice<'pool, I, H, E, G, C>
+unsafe impl<'pool, I, E, G, H, C, M> Guardable<G, [u8]> for BufferSlice<'pool, I, H, E, G, C, M>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
     G: Guard,
     C: AsBufferPool<I, H, E>,
+    M: guard_trait::marker::Mode,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         // TODO: Add something like try_release to the public API of redox-buffer-pool.
@@ -1970,7 +2109,7 @@ where
         match self.guard(guard) {
             Ok(()) => Ok(()),
             Err(WithGuardError { this: new_guard }) => unsafe {
-                let mut existing_guard = self.unguard().expect(
+                let mut existing_guard = self.unguard_unchecked().expect(
                     "expected a BufferSlice not to contain a guard, if the guard method failed",
                 );
 
@@ -1989,14 +2128,13 @@ where
             },
         }
     }
+    #[inline]
     fn try_get_data(&self) -> Option<&[u8]> {
-        if self.has_guard() {
-            return None;
-        }
-        Some(self.as_ref())
+        self.try_as_slice()
     }
 }
-unsafe impl<'pool, I, E, G, H, C> GuardableExclusive<G, [u8]> for BufferSlice<'pool, I, H, E, G, C>
+unsafe impl<'pool, I, E, G, H, C> GuardableShared<G, [u8]>
+    for BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Shared>
 where
     I: Integer,
     H: Handle<I, E>,
@@ -2004,11 +2142,23 @@ where
     G: Guard,
     C: AsBufferPool<I, H, E>,
 {
+    #[inline]
+    fn data_shared(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+unsafe impl<'pool, I, E, G, H, C> GuardableExclusive<G, [u8]>
+    for BufferSlice<'pool, I, H, E, G, C, guard_trait::marker::Exclusive>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    G: Guard,
+    C: AsBufferPool<I, H, E>,
+{
+    #[inline]
     fn try_get_data_mut(&mut self) -> Option<&mut [u8]> {
-        if self.has_guard() {
-            return None;
-        }
-        Some(self.as_mut())
+        self.try_as_slice_mut()
     }
 }
 
