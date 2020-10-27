@@ -1,6 +1,6 @@
 [package]
 name = "redox-buffer-pool"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
 description = "A buffer pool library for Redox, featuring a general-purpose 32-bit allocator"
