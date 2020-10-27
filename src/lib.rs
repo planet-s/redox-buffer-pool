@@ -101,7 +101,7 @@ mod private {
         + ops::BitXor<Self, Output = Self>
     {
         fn zero() -> Self {
-            Self::from(0u8)
+            Self::from(0_u8)
         }
         const MAX: Self;
         fn trailing_zeros(self) -> u32;
@@ -123,7 +123,7 @@ fn occ_map_ready_shift<I: Integer>() -> u32 {
     bit_count - 1
 }
 fn occ_map_used_bit<I: Integer>() -> I {
-    I::from(1u8) << occ_map_ready_shift::<I>()
+    I::from(1_u8) << occ_map_ready_shift::<I>()
 }
 fn occ_map_off_mask<I: Integer>() -> I {
     !occ_map_used_bit::<I>()
@@ -337,7 +337,7 @@ impl<I: Integer> BufferPoolOptions<I> {
     }
     /// Reduce the minimum alignment to 1.
     pub fn with_no_minimum_alignment(self) -> Self {
-        self.with_minimum_alignment(I::from(1u8))
+        self.with_minimum_alignment(I::from(1_u8))
     }
     /// Set the minimum possible alignment, causing allocations with smaller alignments to use this
     /// alignment instead. This will override the maximum alignment, if this were to be larger than
@@ -387,7 +387,7 @@ impl<I: Integer> Default for BufferPoolOptions<I> {
             // Default to unlimited. TODO
             log2_maximum_alignment: cmp::max(log2_minimum_alignment, log2_maximum_alignment),
             maximum_size: I::MAX,
-            minimum_size: I::from(1u8),
+            minimum_size: I::from(1_u8),
         }
     }
 }
@@ -1056,18 +1056,31 @@ where
         strategy: AllocationStrategy<I>,
         guarded: bool,
     ) -> Option<AcquireSliceRet<I, E>> {
+        fn align<I: Integer>(off: I, alignment: I) -> Option<I> {
+            assert_ne!(alignment, I::from(0_u8));
+            assert!(alignment.is_power_of_two());
+
+            if alignment == I::from(1_u8) {
+                return Some(off);
+            }
+
+            off.checked_add(alignment - I::from(1_u8))?
+                .checked_div(alignment)?
+                .checked_mul(alignment)
+        }
+
         assert_ne!(len, I::zero());
 
         if len > self.options.maximum_size {
             return None;
         }
 
-        if alignment > (I::from(1u8) << self.options.log2_maximum_alignment) {
+        if alignment > (I::from(1_u8) << self.options.log2_maximum_alignment) {
             return None;
         }
         let alignment = cmp::max(
             alignment,
-            I::from(1u8) << self.options.log2_minimum_alignment,
+            I::from(1_u8) << self.options.log2_minimum_alignment,
         );
 
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
@@ -1075,19 +1088,6 @@ where
         // threads checking whether it's safe to munmap certain offsets.
         let occ_intent_guard = self.occ_map.upgradable_read();
         let free_intent_guard = self.free_map.upgradable_read();
-
-        fn align<I: Integer>(off: I, alignment: I) -> Option<I> {
-            assert_ne!(alignment, I::from(0u8));
-            assert!(alignment.is_power_of_two());
-
-            if alignment == I::from(1u8) {
-                return Some(off);
-            }
-
-            off.checked_add(alignment - I::from(1u8))?
-                .checked_div(alignment)?
-                .checked_mul(alignment)
-        }
 
         let (occ_k, occ_v, free_e, advancement) = if let AllocationStrategy::Fixed(at) = strategy {
             assert_eq!(at % alignment, I::zero());
