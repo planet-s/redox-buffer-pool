@@ -19,7 +19,7 @@ std = ["parking_lot"]
 redox = ["redox_syscall"]
 
 [dependencies]
-guard-trait = "0.3"
+guard-trait = "0.4"
 log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"], optional = true }
 spinning = { version = "0.0.3", optional = true }
