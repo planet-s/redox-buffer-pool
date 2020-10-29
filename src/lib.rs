@@ -1858,12 +1858,11 @@ mod libc_error_impls {
     }
 }
 
-unsafe impl<'pool, I, H, E, G, C> Guarded for BufferSlice<'pool, I, H, E, G, C>
+unsafe impl<'pool, I, H, E, C> Guarded for BufferSlice<'pool, I, H, E, marker::Guard, C>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    G: marker::Marker,
     C: AsBufferPool<I, H, E>,
 {
     type Target = [u8];
@@ -1873,18 +1872,28 @@ where
         self.as_slice()
     }
 }
-unsafe impl<'pool, I, H, E, G, C> GuardedMut for BufferSlice<'pool, I, H, E, G, C>
+unsafe impl<'pool, I, H, E, C> GuardedMut for BufferSlice<'pool, I, H, E, marker::Guard, C>
 where
     I: Integer,
     H: Handle<I, E>,
     E: Copy,
-    G: marker::Marker,
     C: AsBufferPool<I, H, E>,
 {
     fn borrow_guarded_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
 }
+/*unsafe impl<'pool, I, H, E, C> StableDeref for BufferSlice<'pool, I, H, E, marker::Guard, C>
+where
+    I: Integer,
+    H: Handle<I, E>,
+    E: Copy,
+    C: AsBufferPool<I, H, E>,
+{
+    fn borrow_guarded_mut(&mut self) -> &mut Self::Target {
+        self.as_slice_mut()
+    }
+}*/
 
 #[cfg(test)]
 mod tests {
